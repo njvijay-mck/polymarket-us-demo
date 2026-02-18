@@ -1,6 +1,6 @@
 # Polymarket US API Demo Scripts
 
-Python scripts demonstrating the [Polymarket US](https://polymarket.us) retail API and SDK. Covers public market data, date-based market filtering, authenticated trading, async concurrency, and real-time WebSocket streaming.
+Python scripts demonstrating the [Polymarket US](https://polymarket.us) retail API and SDK. Covers public market data, date-based market filtering, odds calculation, LLM-powered probability analysis, authenticated trading, async concurrency, and real-time WebSocket streaming.
 
 ## Prerequisites
 
@@ -21,7 +21,7 @@ uv sync
 
 ### API Key Configuration
 
-Scripts 04-07 require authentication. These scripts use `python-dotenv` to auto-load credentials from a `.env` file.
+Scripts 04-07 require Polymarket authentication. Script 09 requires an Anthropic API key for the LLM analysis step. All scripts use `python-dotenv` to auto-load credentials from a `.env` file.
 
 **Recommended: `.env` file**
 
@@ -30,11 +30,12 @@ cp .env.example .env
 # Edit .env with your actual keys
 ```
 
-The `.env` file contains two variables:
+The `.env` file contains:
 
 ```
 POLYMARKET_KEY_ID=your-key-id-uuid
 POLYMARKET_SECRET_KEY=your-base64-encoded-ed25519-private-key
+ANTHROPIC_API_KEY=your-anthropic-api-key
 ```
 
 **Fallback: environment variables**
@@ -148,6 +149,56 @@ uv run 08_markets_by_date.py --date 2025-06-30 --search "election" --verbose
 | `--verbose` | Print raw JSON for the first matching market |
 
 > Uses client-side date filtering with automatic pagination (fetches up to 20 pages). When `--search` is provided, routes through the search endpoint for richer results.
+
+---
+
+#### `09_odds_calculator.py` — Odds Calculator & LLM Probability Analysis
+
+Fetches live market prices, converts them into every major odds format, and passes the data to Claude for plain-English win-probability analysis.
+
+```bash
+# Full analysis for a market slug
+uv run 09_odds_calculator.py btc-100k-2025
+
+# Odds table only — skip the LLM step
+uv run 09_odds_calculator.py btc-100k-2025 --no-llm
+
+# Search for a market then analyse the first result
+uv run 09_odds_calculator.py --search "bitcoin" --pick 0
+
+# Use a more powerful model for deeper analysis
+uv run 09_odds_calculator.py btc-100k-2025 --model claude-opus-4-5
+
+# Show raw market JSON alongside the odds
+uv run 09_odds_calculator.py btc-100k-2025 --verbose
+```
+
+**SDK methods:** `client.markets.retrieve_by_slug()`, `client.search.query()`
+
+**LLM:** Uses the [Anthropic Python SDK](https://github.com/anthropic/anthropic-sdk-python) (`anthropic` package). Requires `ANTHROPIC_API_KEY` in `.env`.
+
+**Odds formats computed:**
+
+| Format | Example | Description |
+|--------|---------|-------------|
+| Implied probability | 62.50% | Direct from Polymarket price |
+| Decimal (European) | 1.6000 | Return per $1 staked including stake |
+| American (moneyline) | -167 / +150 | Negative = favourite, positive = underdog |
+| Fractional (UK) | 3/5 | Profit relative to stake |
+| Book overround | +3.20% | Combined vig/juice across all outcomes |
+
+**Arguments:**
+
+| Flag | Description |
+|------|-------------|
+| `slug` | Market slug to analyse (e.g. `btc-100k-2025`) |
+| `--search QUERY` | Find a market by keyword instead of slug |
+| `--pick N` | Which search result to analyse (0-indexed, default: 0) |
+| `--no-llm` | Skip Claude analysis, show odds table only |
+| `--model MODEL` | Anthropic model (default: `claude-haiku-4-5`) |
+| `--verbose` | Print raw market JSON |
+
+> `slug` and `--search` are mutually exclusive. The LLM step is free to skip with `--no-llm` if you don't have an Anthropic API key.
 
 ---
 
@@ -329,7 +380,8 @@ polymarket-us-init/
 ├── 05_place_order.py         # Auth    — preview & place orders
 ├── 06_async_dashboard.py     # Auth    — async concurrent dashboard
 ├── 07_websocket_stream.py    # Auth    — real-time WebSocket streaming
-└── 08_markets_by_date.py     # Public  — filter markets by resolution date + keyword
+├── 08_markets_by_date.py     # Public  — filter markets by resolution date + keyword
+└── 09_odds_calculator.py     # Public  — odds calculator + Claude LLM analysis
 ```
 
 ## Links

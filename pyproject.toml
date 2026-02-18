@@ -5,6 +5,7 @@ description = "Python scripts demonstrating the Polymarket US retail API and SDK
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "anthropic>=0.80.0",
     "polymarket-us>=0.1.2",
     "python-dotenv>=1.2.1",
 ]
