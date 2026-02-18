@@ -239,6 +239,68 @@ def web_search_context(question: str, metrics: RunMetrics, max_results: int = 6)
     return "\n".join(lines)
 
 
+def social_media_context(question: str, metrics: RunMetrics, max_results: int = 5) -> str:
+    """Query Brave Search for X/Twitter and community sentiment signals.
+
+    Makes two targeted queries (social/X sentiment + Reddit/forum discussion).
+    Returns a formatted markdown block, or an empty string on any failure.
+    Requires BRAVE_SEARCH_API_KEY (same key as web_search_context).
+    """
+    import httpx
+
+    api_key = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
+    if not api_key:
+        return ""
+
+    year = datetime.now(_EST).year
+    queries = [
+        f"{question} twitter X sentiment public opinion {year}",
+        f"{question} reddit community prediction discussion {year}",
+    ]
+
+    all_results: list[dict] = []
+    for query in queries:
+        metrics.search_queries.append(query)
+        try:
+            resp = httpx.get(
+                _BRAVE_SEARCH_URL,
+                headers={
+                    "Accept":               "application/json",
+                    "Accept-Encoding":      "gzip",
+                    "X-Subscription-Token": api_key,
+                },
+                params={"q": query, "count": max_results},
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            all_results.extend(data.get("web", {}).get("results", [])[:max_results])
+        except Exception as exc:
+            print(
+                f"  [Social Search] Brave query failed ({exc.__class__.__name__}) — skipping.",
+                file=sys.stderr,
+            )
+
+    if not all_results:
+        return ""
+
+    lines = ["## Social Media & Community Sentiment\n"]
+    for i, r in enumerate(all_results, 1):
+        title   = r.get("title",       "").strip()
+        url     = r.get("url",         "").strip()
+        snippet = r.get("description", "").strip()[:300]
+        lines.append(f"**[{i}] {title}**")
+        if snippet:
+            lines.append(f"> {snippet}")
+        if url:
+            lines.append(f"Source: {url}")
+        lines.append("")
+        if title or url:
+            metrics.sources.append({"title": title, "url": url})
+
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Market fetching
 # ---------------------------------------------------------------------------
@@ -786,6 +848,24 @@ IMPORTANT: You MUST include the following JSON block (one entry per outcome):
 Replace the outcome names and probabilities with your actual estimates.
 The "outcome" values must exactly match the outcome labels in the market data.
 Probabilities must sum to 1.0.
+
+IMPORTANT: You MUST also include a sentiment JSON block based on the social
+media and community signals provided:
+
+```sentiment-json
+{"overall": "bullish", "score": 0.72, "volume": "high",
+ "signals": ["strong X buzz", "Reddit community bullish"],
+ "summary": "Community strongly expects Yes resolution"}
+```
+
+Where:
+- "overall": "bullish", "bearish", or "neutral"
+- "score": 0.0 (strongly bearish) to 1.0 (strongly bullish), 0.5 is neutral
+- "volume": "low", "moderate", or "high" (social discussion activity)
+- "signals": 2-3 short phrases drawn from social/community evidence
+- "summary": one sentence summarising the social sentiment
+
+If no social media data was provided, use "neutral", score 0.5, volume "low".
 """
 
 
@@ -799,17 +879,27 @@ def deep_research_pipeline(
     payload_json = json.dumps(_build_market_payload(market, rows), indent=2)
     market_block = f"## Market Data\n\n```json\n{payload_json}\n```\n\n"
 
-    # Step 0: Web search
+    # Step 0a: Web search
     print("  [0/4] Web Search ...")
     sys.stdout.flush()
     web_context = web_search_context(market.get("question", ""), metrics)
     if web_context:
         metrics.agents_run.append("Web Search")
-        web_block = web_context + "\n\n"
-    else:
-        web_block = ""
 
-    research_input = market_block + web_block
+    # Step 0b: Social media sentiment search
+    print("  [0/4] Social Search ...")
+    sys.stdout.flush()
+    social_context = social_media_context(market.get("question", ""), metrics)
+    if social_context:
+        metrics.agents_run.append("Social Search")
+
+    context_block = ""
+    if web_context:
+        context_block += web_context + "\n\n"
+    if social_context:
+        context_block += social_context + "\n\n"
+
+    research_input = market_block + context_block
 
     # Stage 1: Research
     print("  [1/4] Running Research Agent ...")
@@ -892,6 +982,18 @@ def parse_llm_probabilities(text: str) -> list[dict]:
             except json.JSONDecodeError:
                 continue
     return []
+
+
+def parse_sentiment(text: str) -> dict | None:
+    """Extract the sentiment JSON object from the consolidation stage output."""
+    for m in re.finditer(r"```sentiment-json\s*(\{.*?\})\s*```", text, re.DOTALL):
+        try:
+            data = json.loads(m.group(1))
+            if "overall" in data and "score" in data:
+                return data
+        except json.JSONDecodeError:
+            continue
+    return None
 
 
 def display_edge_analysis(
@@ -1031,6 +1133,60 @@ def display_ev_analysis(rows: list[dict], llm_probs: list[dict]) -> None:
             f"\n  Best EV: BUY {best[0].upper()} at ${best[1]:.2f}"
             f"  \u2192  {best[2]:+.2f} per contract  ({best[3]:+.1f}% ROI)\n"
         )
+
+
+def display_sentiment_analysis(sentiment: dict | None) -> None:
+    """Print a social sentiment summary box from the consolidation stage output."""
+    if not sentiment:
+        return
+
+    overall = sentiment.get("overall", "neutral").capitalize()
+    score   = float(sentiment.get("score", 0.5))
+    volume  = sentiment.get("volume", "moderate").capitalize()
+    signals = sentiment.get("signals", [])
+    summary = sentiment.get("summary", "").strip()
+
+    if score >= 0.70:
+        indicator = "\u25b2\u25b2\u25b2  Strongly Bullish"
+    elif score >= 0.55:
+        indicator = "\u25b2\u25b2   Bullish"
+    elif score >= 0.45:
+        indicator = "\u2500\u2500\u2500  Neutral"
+    elif score >= 0.30:
+        indicator = "\u25bc\u25bc   Bearish"
+    else:
+        indicator = "\u25bc\u25bc\u25bc  Strongly Bearish"
+
+    C1, C2, C3 = 18, 14, 28
+    inner = C1 + C2 + C3 + 2
+
+    print(f"\n╔{'═' * inner}╗")
+    print(f"║{'  SOCIAL SENTIMENT  (X / web signals)':<{inner}}║")
+    print(f"╠{'═'*C1}╦{'═'*C2}╦{'═'*C3}╣")
+    print(
+        f"║ {'Overall tone':<{C1-1}}"
+        f"║ {overall:<{C2-1}}"
+        f"║ {indicator:<{C3-1}}║"
+    )
+    print(
+        f"║ {'Score':<{C1-1}}"
+        f"║ {score:<{C2-1}.2f}"
+        f"║ {'':>{C3-1}}║"
+    )
+    print(
+        f"║ {'Discussion vol':<{C1-1}}"
+        f"║ {volume:<{C2-1}}"
+        f"║ {'':>{C3-1}}║"
+    )
+    print(f"╚{'═'*C1}╩{'═'*C2}╩{'═'*C3}╝")
+
+    if signals:
+        signals_str = "  |  ".join(f'"{s}"' for s in signals)
+        print(f"\n  Signals : {signals_str}")
+    if summary:
+        print(f"  Summary : {summary}\n")
+    else:
+        print()
 
 
 # ---------------------------------------------------------------------------
@@ -1265,6 +1421,8 @@ Examples:
                 llm_probs = parse_llm_probabilities(final_report)
                 display_edge_analysis(rows, llm_probs, edge_threshold=args.edge_threshold)
                 display_ev_analysis(rows, llm_probs)
+                sentiment = parse_sentiment(final_report)
+                display_sentiment_analysis(sentiment)
             else:
                 metrics.pipeline = "single-pass"
                 web_context = ""
