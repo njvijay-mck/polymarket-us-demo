@@ -122,7 +122,11 @@ def overround(prices: list[float]) -> float:
 
 def fetch_market_by_slug(client: PolymarketUS, slug: str) -> dict:
     try:
-        return client.markets.retrieve_by_slug(slug)
+        resp = client.markets.retrieve_by_slug(slug)
+        # API wraps single-market responses under a "market" key
+        if isinstance(resp, dict) and "market" in resp:
+            return resp["market"]
+        return resp
     except NotFoundError:
         print(f"\n  Market slug '{slug}' not found.", file=sys.stderr)
         sys.exit(1)
@@ -160,20 +164,59 @@ def search_and_pick(client: PolymarketUS, query: str, pick: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def build_odds_table(market: dict) -> list[dict[str, Any]]:
-    """Return a list of outcome dicts with all odds representations."""
+    """Return a list of outcome dicts with all odds representations.
+
+    Supports two data shapes:
+    - Standard markets: outcomes + outcomePrices JSON strings
+    - Sports moneyline markets: marketSides list with per-side price + team info
+    """
     outcomes = _parse_json_str(market.get("outcomes"))
     prices_raw = _parse_json_str(market.get("outcomePrices"))
 
+    # --- Primary path: outcomes + outcomePrices both present and aligned ------
+    if outcomes and prices_raw and len(outcomes) == len(prices_raw):
+        rows = []
+        for outcome, price_str in zip(outcomes, prices_raw):
+            try:
+                price = float(price_str)
+            except (ValueError, TypeError):
+                price = 0.0
+            prob = implied_probability(price)
+            rows.append({
+                "outcome":      outcome,
+                "price":        price,
+                "implied_prob": prob,
+                "prob_pct":     round(prob * 100, 2),
+                "decimal":      decimal_odds(prob),
+                "american":     american_odds(prob),
+                "fractional":   fractional_odds(prob),
+            })
+        return rows
+
+    # --- Fallback: sports markets store prices in marketSides -----------------
+    sides = market.get("marketSides", [])
+    if not sides or not isinstance(sides, list):
+        return []
+
     rows = []
-    for outcome, price_str in zip(outcomes, prices_raw):
+    for side in sides:
+        if not isinstance(side, dict):
+            continue
+        # Outcome label: use team name if available, else side description
+        team = side.get("team") or {}
+        label = team.get("name") or side.get("description", "Unknown")
+        record = team.get("record", "")
+        if record:
+            label = f"{label} ({record})"
+
         try:
-            price = float(price_str)
+            price = float(side.get("price", 0))
         except (ValueError, TypeError):
             price = 0.0
 
         prob = implied_probability(price)
         rows.append({
-            "outcome":      outcome,
+            "outcome":      label,
             "price":        price,
             "implied_prob": prob,
             "prob_pct":     round(prob * 100, 2),
