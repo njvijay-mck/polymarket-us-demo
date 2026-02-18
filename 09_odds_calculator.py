@@ -254,8 +254,13 @@ def fetch_market_by_slug(client: PolymarketUS, slug: str) -> dict:
         sys.exit(1)
 
 
-def search_and_pick(client: PolymarketUS, query: str, pick: int, limit: int) -> dict:
-    """Search for markets, show a numbered list, and return the one at *pick*."""
+def search_and_pick(
+    client: PolymarketUS, query: str, pick: int | None, limit: int
+) -> list[dict]:
+    """Search for markets, show a numbered list, and return them.
+
+    If *pick* is given, returns only that one market; otherwise returns all.
+    """
     fetch_n = max(limit * 2, 20)
     resp = client.search.query({"query": query, "limit": fetch_n})
     markets: list[dict] = []
@@ -280,29 +285,29 @@ def search_and_pick(client: PolymarketUS, query: str, pick: int, limit: int) -> 
         print(f"  [{i}] {q}  [{cat}]{marker}")
     print()
 
-    if pick >= len(markets):
-        print(
-            f"\n  --pick {pick} out of range; only {len(markets)} market(s) found.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    if pick is not None:
+        if pick >= len(markets):
+            print(
+                f"\n  --pick {pick} out of range; only {len(markets)} market(s) found.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return [markets[pick]]
 
-    selected = markets[pick]
-    print(f"  Analysing [{pick}]: {selected.get('question', 'Untitled')}\n")
-    return selected
+    return markets
 
 
 def search_by_date(
     client: PolymarketUS,
     date_str: str,
-    pick: int,
+    pick: int | None,
     limit: int,
-) -> dict:
+) -> list[dict]:
     """Find markets resolving on *date_str* (YYYY-MM-DD, Eastern Time).
 
     Paginates through the markets list until *limit* matches are found or the
-    API is exhausted, then displays a numbered menu and returns the *pick*-th
-    result.
+    API is exhausted, then displays a numbered menu and returns them.
+    If *pick* is given, returns only that one market; otherwise returns all.
     """
     try:
         target_est = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -357,16 +362,16 @@ def search_by_date(
         print(f"  [{i}] {q}  [{cat}]  {end_est}{marker}")
     print()
 
-    if pick >= len(candidates):
-        print(
-            f"\n  --pick {pick} out of range; only {len(candidates)} market(s) found.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    if pick is not None:
+        if pick >= len(candidates):
+            print(
+                f"\n  --pick {pick} out of range; only {len(candidates)} market(s) found.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return [candidates[pick]]
 
-    selected = candidates[pick]
-    print(f"  Analysing [{pick}]: {selected.get('question', 'Untitled')}\n")
-    return selected
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +968,71 @@ def display_edge_analysis(
         print(f"\n  No edge detected above threshold ({edge_threshold:.1f}%).\n")
 
 
+def display_ev_analysis(rows: list[dict], llm_probs: list[dict]) -> None:
+    """Print EV per $1 contract for each outcome using LLM probability estimates."""
+    if not llm_probs:
+        return
+
+    llm_map: dict[str, float] = {
+        item["outcome"].lower(): float(item["llm_probability"])
+        for item in llm_probs
+        if "outcome" in item and "llm_probability" in item
+    }
+
+    matched: list[tuple[str, float, float]] = []
+    for row in rows:
+        label = row.get("outcome", "")
+        price = row.get("price", 0.0)
+        key   = label.lower()
+        if key in llm_map:
+            matched.append((label, price, llm_map[key]))
+        else:
+            for lk, lp in llm_map.items():
+                if lk in key or key in lk:
+                    matched.append((label, price, lp))
+                    break
+
+    if not matched:
+        return
+
+    C1, C2, C3, C4 = 22, 12, 12, 20
+    inner = C1 + C2 + C3 + C4 + 3
+
+    print(f"\n╔{'═' * inner}╗")
+    print(f"║{'  EXPECTED VALUE  (per $1 contract)':<{inner}}║")
+    print(f"╠{'═'*C1}╦{'═'*C2}╦{'═'*C3}╦{'═'*C4}╣")
+    print(
+        f"║ {'Outcome':<{C1-1}}"
+        f"║ {'Buy at':<{C2-1}}"
+        f"║ {'LLM Prob':<{C3-1}}"
+        f"║ {'EV / ROI':<{C4-1}}║"
+    )
+    print(f"╠{'═'*C1}╬{'═'*C2}╬{'═'*C3}╬{'═'*C4}╣")
+
+    best: tuple[str, float, float, float] | None = None  # label, price, ev, roi
+    for label, price, llm_p in matched:
+        ev  = llm_p - price
+        roi = (ev / price * 100) if price > 0 else 0.0
+        arrow = "\u25b2" if ev > 0 else "\u25bc"
+        ev_roi_str = f"{ev:+.2f}  {roi:+.1f}% {arrow}"
+        print(
+            f"║ {label:<{C1-1}}"
+            f"║ ${price:>8.4f}  "
+            f"║ {llm_p * 100:>7.2f}%  "
+            f"║ {ev_roi_str:<{C4-1}}║"
+        )
+        if best is None or ev > best[2]:
+            best = (label, price, ev, roi)
+
+    print(f"╚{'═'*C1}╩{'═'*C2}╩{'═'*C3}╩{'═'*C4}╝")
+
+    if best and best[2] > 0:
+        print(
+            f"\n  Best EV: BUY {best[0].upper()} at ${best[1]:.2f}"
+            f"  \u2192  {best[2]:+.2f} per contract  ({best[3]:+.1f}% ROI)\n"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Run metrics summary
 # ---------------------------------------------------------------------------
@@ -1020,8 +1090,6 @@ def display_run_metrics(metrics: RunMetrics) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    metrics = RunMetrics()
-
     parser = argparse.ArgumentParser(
         description="Odds calculator + LLM probability analysis for a Polymarket market",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1058,9 +1126,9 @@ Examples:
     parser.add_argument(
         "--pick",
         type=int,
-        default=0,
+        default=None,
         metavar="N",
-        help="Which result to analyse when using --search or --date (0-indexed, default: 0)",
+        help="Analyse only result N (0-indexed) when using --search or --date; omit to analyse all",
     )
     parser.add_argument(
         "--limit",
@@ -1137,64 +1205,84 @@ Examples:
     pm_client = PolymarketUS()
 
     try:
-        # -- Fetch market ------------------------------------------------------
+        # -- Fetch market list -------------------------------------------------
         if args.slug:
             print(f"Fetching market: {args.slug} ...")
-            market = fetch_market_by_slug(pm_client, args.slug)
+            markets = [fetch_market_by_slug(pm_client, args.slug)]
         elif args.search:
-            market = search_and_pick(pm_client, args.search, args.pick, args.limit)
+            markets = search_and_pick(pm_client, args.search, args.pick, args.limit)
         else:
-            market = search_by_date(pm_client, args.date, args.pick, args.limit)
+            markets = search_by_date(pm_client, args.date, args.pick, args.limit)
 
-        # -- Build & display odds ---------------------------------------------
-        rows = build_odds_table(market)
-        if not rows:
-            print("\n  No outcome price data available for this market.", file=sys.stderr)
-            sys.exit(1)
+        # Create LLM client once (reused across all markets)
+        llm_client = None
+        if not args.no_llm:
+            llm_client = create_llm_client(
+                provider=args.llm,
+                model=args.model,
+                api_key=args.llm_api_key,
+                base_url=args.llm_base_url,
+            )
 
-        display_odds(market, rows, verbose=args.verbose)
+        # -- Analyse each market -----------------------------------------------
+        for idx, market in enumerate(markets):
+            metrics = RunMetrics()
 
-        # -- LLM analysis -----------------------------------------------------
-        if args.no_llm:
-            metrics.pipeline = "none (--no-llm)"
-            print("  (LLM analysis skipped — run without --no-llm to enable)\n")
-            display_run_metrics(metrics)
-            return
-
-        llm_client = create_llm_client(
-            provider=args.llm,
-            model=args.model,
-            api_key=args.llm_api_key,
-            base_url=args.llm_base_url,
-        )
-        metrics.provider = args.llm
-        metrics.model    = llm_client.model
-
-        if args.deep_research:
-            metrics.pipeline = "deep-research"
-            print(f"  Running deep research pipeline [{args.llm}] ...\n")
-            final_report = deep_research_pipeline(market, rows, llm_client, metrics)
-            display_deep_research(final_report, provider=args.llm)
-            llm_probs = parse_llm_probabilities(final_report)
-            display_edge_analysis(rows, llm_probs, edge_threshold=args.edge_threshold)
-        else:
-            metrics.pipeline = "single-pass"
-            web_context = ""
-            if args.web_search:
-                print("  [Web Search] Fetching public metrics ...")
-                sys.stdout.flush()
-                web_context = web_search_context(
-                    market.get("question", ""), metrics
+            if len(markets) > 1:
+                W = 72
+                print(f"\n{'━' * W}")
+                print(
+                    f"  MARKET {idx + 1} / {len(markets)}: "
+                    f"{market.get('question', 'Untitled')}"
                 )
-                if web_context:
-                    metrics.agents_run.append("Web Search")
+                print(f"{'━' * W}\n")
 
-            metrics.agents_run.append("Analysis")
-            print(f"  Asking {args.llm} for analysis ...\n")
-            analysis = llm_analysis(market, rows, llm_client, web_context=web_context)
-            display_llm_analysis(analysis, provider=args.llm)
+            rows = build_odds_table(market)
+            if not rows:
+                print(
+                    f"\n  No outcome price data available for market [{idx}].",
+                    file=sys.stderr,
+                )
+                continue
 
-        display_run_metrics(metrics)
+            display_odds(market, rows, verbose=args.verbose)
+
+            # -- LLM analysis --------------------------------------------------
+            if args.no_llm:
+                metrics.pipeline = "none (--no-llm)"
+                print("  (LLM analysis skipped — run without --no-llm to enable)\n")
+                display_run_metrics(metrics)
+                continue
+
+            metrics.provider = args.llm
+            metrics.model    = llm_client.model
+
+            if args.deep_research:
+                metrics.pipeline = "deep-research"
+                print(f"  Running deep research pipeline [{args.llm}] ...\n")
+                final_report = deep_research_pipeline(market, rows, llm_client, metrics)
+                display_deep_research(final_report, provider=args.llm)
+                llm_probs = parse_llm_probabilities(final_report)
+                display_edge_analysis(rows, llm_probs, edge_threshold=args.edge_threshold)
+                display_ev_analysis(rows, llm_probs)
+            else:
+                metrics.pipeline = "single-pass"
+                web_context = ""
+                if args.web_search:
+                    print("  [Web Search] Fetching public metrics ...")
+                    sys.stdout.flush()
+                    web_context = web_search_context(
+                        market.get("question", ""), metrics
+                    )
+                    if web_context:
+                        metrics.agents_run.append("Web Search")
+
+                metrics.agents_run.append("Analysis")
+                print(f"  Asking {args.llm} for analysis ...\n")
+                analysis = llm_analysis(market, rows, llm_client, web_context=web_context)
+                display_llm_analysis(analysis, provider=args.llm)
+
+            display_run_metrics(metrics)
 
     except APIConnectionError as e:
         print(f"\nConnection error: {e.message}", file=sys.stderr)
