@@ -8,6 +8,8 @@ Python scripts demonstrating the [Polymarket US](https://polymarket.us) retail A
 - **[uv](https://docs.astral.sh/uv/)** package manager
 - **Polymarket US account** (for authenticated endpoints) — download the iOS app, create an account, and complete identity verification
 - **API keys** (for authenticated endpoints) — generate at [polymarket.us/developer](https://polymarket.us/developer)
+- **LLM API key** (for script 09) — at least one of: Anthropic, OpenAI, Kimi, or a compatible local endpoint
+- **Brave Search API key** (optional, for script 09 web enrichment) — get one at [brave.com/search/api](https://brave.com/search/api/)
 
 ## Setup
 
@@ -21,7 +23,7 @@ uv sync
 
 ### API Key Configuration
 
-Scripts 04-07 require Polymarket authentication. Script 09 requires an Anthropic API key for the LLM analysis step. All scripts use `python-dotenv` to auto-load credentials from a `.env` file.
+Scripts 04–07 require Polymarket authentication. Script 09 requires an LLM API key for the analysis step. All scripts use `python-dotenv` to auto-load credentials from a `.env` file.
 
 **Recommended: `.env` file**
 
@@ -30,17 +32,28 @@ cp .env.example .env
 # Edit .env with your actual keys
 ```
 
-The `.env` file contains:
+The `.env` file supports:
 
 ```
+# Polymarket trading (scripts 04-07)
 POLYMARKET_KEY_ID=your-key-id-uuid
 POLYMARKET_SECRET_KEY=your-base64-encoded-ed25519-private-key
-ANTHROPIC_API_KEY=your-anthropic-api-key
+
+# Brave Search API — enriches deep research with live web results (script 09)
+# Get your key at https://brave.com/search/api/
+BRAVE_SEARCH_API_KEY=your-brave-search-api-key
+
+# LLM providers for script 09 — only set the one(s) you use
+ANTHROPIC_API_KEY=your-anthropic-api-key        # Claude (default)
+OPENAI_API_KEY=your-openai-api-key              # OpenAI GPT models
+KIMI_API_KEY=sk-kimi-your-key-here              # Kimi Code (kimi.com/code)
+LLM_API_KEY=your-key                            # Custom OpenAI-compatible endpoint
+LLM_BASE_URL=https://your-provider.com/v1       # Custom endpoint base URL
 ```
 
 **Fallback: environment variables**
 
-If you prefer not to use a `.env` file, you can set the variables directly in your shell:
+If you prefer not to use a `.env` file, set the variables directly in your shell:
 
 **Windows (CMD):**
 ```cmd
@@ -154,51 +167,181 @@ uv run 08_markets_by_date.py --date 2025-06-30 --search "election" --verbose
 
 #### `09_odds_calculator.py` — Odds Calculator & LLM Probability Analysis
 
-Fetches live market prices, converts them into every major odds format, and passes the data to Claude for plain-English win-probability analysis.
+Fetches live market prices, converts them into every major odds format, and passes the data to an LLM for analysis. Supports three ways to identify a market (slug, keyword search, or resolution date in EST), multiple LLM providers, an optional 4-stage deep research pipeline powered by Brave Search web results, and a run summary footer listing every agent and source used.
+
+##### Quick start
 
 ```bash
-# Full analysis for a market slug
+# Odds table + single-pass Claude analysis (default)
 uv run 09_odds_calculator.py btc-100k-2025
 
-# Odds table only — skip the LLM step
+# Odds only — no LLM required
 uv run 09_odds_calculator.py btc-100k-2025 --no-llm
 
-# Search for a market then analyse the first result
-uv run 09_odds_calculator.py --search "bitcoin" --pick 0
+# Keyword search — show top 5, analyse result #0
+uv run 09_odds_calculator.py --search "NBA finals" --limit 5 --pick 0
 
-# Use a more powerful model for deeper analysis
-uv run 09_odds_calculator.py btc-100k-2025 --model claude-opus-4-5
-
-# Show raw market JSON alongside the odds
-uv run 09_odds_calculator.py btc-100k-2025 --verbose
+# Date search — all markets resolving 2026-03-15 (Eastern Time), pick #0
+uv run 09_odds_calculator.py --date 2026-03-15 --limit 10 --pick 0
 ```
 
-**SDK methods:** `client.markets.retrieve_by_slug()`, `client.search.query()`
+##### Choosing an LLM provider
 
-**LLM:** Uses the [Anthropic Python SDK](https://github.com/anthropic/anthropic-sdk-python) (`anthropic` package). Requires `ANTHROPIC_API_KEY` in `.env`.
+Use `--llm` to select a provider. Each provider reads its API key from the environment automatically.
 
-**Odds formats computed:**
+| Provider | Flag | Env var | Default model |
+|----------|------|---------|---------------|
+| Claude (default) | `--llm claude` | `ANTHROPIC_API_KEY` | `claude-haiku-4-5` |
+| OpenAI | `--llm openai` | `OPENAI_API_KEY` | `gpt-4o` |
+| Kimi Code | `--llm kimi` | `KIMI_API_KEY` | `kimi-for-coding` |
+| Custom endpoint | `--llm custom` | `LLM_API_KEY` + `LLM_BASE_URL` | *(must set `--model`)* |
+
+```bash
+# Claude with a more powerful model
+uv run 09_odds_calculator.py btc-100k-2025 --llm claude --model claude-opus-4-6
+
+# OpenAI GPT-4o (uses OPENAI_API_KEY from .env)
+uv run 09_odds_calculator.py btc-100k-2025 --llm openai
+
+# OpenAI with a specific model
+uv run 09_odds_calculator.py btc-100k-2025 --llm openai --model gpt-4o-mini
+
+# Kimi Code (key: sk-kimi-..., get it at kimi.com/code)
+uv run 09_odds_calculator.py btc-100k-2025 --llm kimi
+
+# Local Ollama (OpenAI-compatible)
+uv run 09_odds_calculator.py btc-100k-2025 --llm custom --model llama3.2 \
+    --llm-base-url http://localhost:11434/v1 --llm-api-key ollama
+
+# Groq (OpenAI-compatible)
+uv run 09_odds_calculator.py btc-100k-2025 --llm custom --model llama-3.3-70b-versatile \
+    --llm-base-url https://api.groq.com/openai/v1 --llm-api-key "$GROQ_API_KEY"
+
+# Override API key inline without editing .env
+uv run 09_odds_calculator.py btc-100k-2025 --llm openai --llm-api-key sk-...
+```
+
+##### Brave Search web enrichment
+
+When `BRAVE_SEARCH_API_KEY` is set, the script queries the [Brave Search API](https://brave.com/search/api/) for live team statistics, recent news, and public metrics relevant to the market question. Results are injected into the LLM context before analysis so the model reasons from current data rather than training knowledge alone.
+
+- **Deep research** (`--deep-research`): web search always runs as step 0.
+- **Single-pass**: opt in with `--web-search`.
+- If the key is missing or the search fails, analysis continues without web context.
+
+##### Deep research pipeline (`--deep-research`)
+
+Enables a web-search step followed by 4 LLM stages, each feeding into the next:
+
+| Step | Role | Output |
+|------|------|--------|
+| 0 — Web Search | Brave Search for live team/event stats and recent news | Web context block |
+| 1 — Research | Investigates using web results + training knowledge; initial probability estimate | Research report |
+| 2 — Critique | Stress-tests the research: gaps, biases, counter-arguments, alternative scenarios | Critique report |
+| 3 — Rebuttal | Responds to critiques, concedes where valid, defends where not, revised estimate | Rebuttal report |
+| 4 — Consolidation | Synthesises all findings into a final probability estimate (JSON) + recommendation | Final report + edge analysis |
+
+Progress is printed as each step runs:
+```
+  [0/4] Web Search ...
+  [1/4] Running Research Agent ...
+  [2/4] Running Critique Agent ...
+  [3/4] Running Rebuttal Agent ...
+  [4/4] Running Consolidation Agent ...
+```
+
+After Stage 4, the script automatically compares the LLM's probability estimate against Polymarket's implied probability and displays an edge analysis table:
+
+```
+╔═════════════════════════════════════════════════════════════╗
+║  EDGE ANALYSIS  (threshold: 5.0%)                           ║
+╠══════════════════════╦════════════╦════════════╦════════════╣
+║ Outcome              ║ Market %   ║ LLM Est %  ║ Edge       ║
+╠══════════════════════╬════════════╬════════════╬════════════╣
+║ Yes                  ║   35.00%   ║   55.00%   ║ +20.0% ▲  ║
+║ No                   ║   65.00%   ║   45.00%   ║ -20.0% ▼  ║
+╚══════════════════════╩════════════╩════════════╩════════════╝
+
+  *** RECOMMENDED POSITION: BUY YES  (edge +20.0%) ***
+```
+
+If no outcome exceeds the edge threshold: `No edge detected above threshold (5.0%).`
+
+```bash
+# Deep research with Kimi (Brave Search enrichment automatic)
+uv run 09_odds_calculator.py btc-100k-2025 --llm kimi --deep-research
+
+# Lower edge threshold to 3%
+uv run 09_odds_calculator.py btc-100k-2025 --deep-research --edge-threshold 3
+
+# Date search → deep research with Kimi
+uv run 09_odds_calculator.py --date 2026-03-15 --llm kimi --deep-research
+
+# Keyword search → deep research with OpenAI
+uv run 09_odds_calculator.py --search "bitcoin" --pick 0 --llm openai --deep-research
+
+# Single-pass + web search
+uv run 09_odds_calculator.py btc-100k-2025 --web-search
+
+# Deep research + raw JSON
+uv run 09_odds_calculator.py btc-100k-2025 --deep-research --verbose
+```
+
+##### Run summary footer
+
+Every run (including `--no-llm`) prints a summary at the end:
+
+```
+========================================================================
+  RUN SUMMARY
+========================================================================
+  Provider  : kimi  (kimi-for-coding)
+  Pipeline  : deep-research
+  Agents    : Web Search → Research → Critique → Rebuttal → Consolidation
+  Duration  : 38.4 s
+
+  SOURCES REFERENCED  (6 from web search)
+  ------------------------------------------------------------------------
+  [ 1] Golden State Warriors vs. Lakers: Game Preview & Stats
+        https://www.nba.com/game/...
+  [ 2] Lakers 2025-26 Season Statistics | Basketball-Reference
+        https://www.basketball-reference.com/...
+  ...
+========================================================================
+```
+
+##### Odds formats computed
 
 | Format | Example | Description |
 |--------|---------|-------------|
 | Implied probability | 62.50% | Direct from Polymarket price |
 | Decimal (European) | 1.6000 | Return per $1 staked including stake |
-| American (moneyline) | -167 / +150 | Negative = favourite, positive = underdog |
+| American (moneyline) | −167 / +150 | Negative = favourite, positive = underdog |
 | Fractional (UK) | 3/5 | Profit relative to stake |
 | Book overround | +3.20% | Combined vig/juice across all outcomes |
 
-**Arguments:**
+##### All flags
 
-| Flag | Description |
-|------|-------------|
-| `slug` | Market slug to analyse (e.g. `btc-100k-2025`) |
-| `--search QUERY` | Find a market by keyword instead of slug |
-| `--pick N` | Which search result to analyse (0-indexed, default: 0) |
-| `--no-llm` | Skip Claude analysis, show odds table only |
-| `--model MODEL` | Anthropic model (default: `claude-haiku-4-5`) |
-| `--verbose` | Print raw market JSON |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `slug` | — | Market slug to analyse (e.g. `btc-100k-2025`) |
+| `--search QUERY` | — | Find a market by keyword |
+| `--date YYYY-MM-DD` | — | Find markets resolving on this date (Eastern Time) |
+| `--pick N` | `0` | Which listed result to analyse (0-indexed) |
+| `--limit N` | `10` | Max markets to show when using `--search` or `--date` |
+| `--no-llm` | off | Show odds table only, skip all LLM calls |
+| `--llm PROVIDER` | `claude` | LLM provider: `claude`, `openai`, `kimi`, `custom` |
+| `--model MODEL` | *(per-provider default)* | Override the model ID |
+| `--llm-base-url URL` | — | Base URL for a custom OpenAI-compatible endpoint |
+| `--llm-api-key KEY` | — | Inline API key override (otherwise read from env) |
+| `--deep-research` | off | Enable web search + 4-stage pipeline + edge analysis |
+| `--web-search` | off | Run Brave Search to enrich single-pass analysis |
+| `--edge-threshold N` | `5` | Minimum % edge to flag a recommended position |
+| `--verbose` | off | Print raw market JSON |
 
-> `slug` and `--search` are mutually exclusive. The LLM step is free to skip with `--no-llm` if you don't have an Anthropic API key.
+> `slug`, `--search`, and `--date` are mutually exclusive. The `--no-llm` flag requires no API key at all. `BRAVE_SEARCH_API_KEY` enables web enrichment for `--web-search` and `--deep-research`; if unset the pipeline continues without web context and prints a warning.
+
+**SDK methods:** `client.markets.retrieve_by_slug()`, `client.search.query()`
 
 ---
 
@@ -246,7 +389,7 @@ uv run 05_place_order.py --cancel-all
 | Flag | Values | Description |
 |------|--------|-------------|
 | `--side` | `long`, `short` | Maps to `ORDER_INTENT_BUY_LONG` / `ORDER_INTENT_BUY_SHORT` |
-| `--price` | `0.01` - `0.99` | Limit price in USD |
+| `--price` | `0.01` – `0.99` | Limit price in USD |
 | `--qty` | integer | Number of whole contracts (fractional not supported) |
 | `--tif` | `gtc`, `ioc`, `fok` | Good-til-cancel (default), immediate-or-cancel, fill-or-kill |
 
@@ -369,7 +512,7 @@ from polymarket_us import (
 
 ```
 polymarket-us-init/
-├── .env.example              # API credentials template
+├── .env.example              # API credentials template (all providers)
 ├── .python-version           # Python 3.13
 ├── pyproject.toml            # Project config & dependencies
 ├── uv.lock                   # Locked dependency versions
@@ -381,8 +524,19 @@ polymarket-us-init/
 ├── 06_async_dashboard.py     # Auth    — async concurrent dashboard
 ├── 07_websocket_stream.py    # Auth    — real-time WebSocket streaming
 ├── 08_markets_by_date.py     # Public  — filter markets by resolution date + keyword
-└── 09_odds_calculator.py     # Public  — odds calculator + Claude LLM analysis
+└── 09_odds_calculator.py     # Public  — odds calculator + multi-provider LLM analysis
+                              #           with optional 4-stage deep research pipeline
 ```
+
+## Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| `polymarket-us` | Polymarket US API SDK |
+| `anthropic` | Claude / Kimi LLM client (script 09, `--llm claude` or `--llm kimi`) |
+| `openai` | OpenAI / custom-endpoint client (script 09, `--llm openai/custom`) |
+| `httpx` | HTTP client for Brave Search API calls (script 09 web search) |
+| `python-dotenv` | Load `.env` credentials automatically |
 
 ## Links
 
