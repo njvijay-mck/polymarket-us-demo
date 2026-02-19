@@ -89,11 +89,58 @@ class ConsolidatedReport:
     reports: list[ReportData]
     edge_threshold: float = 5.0
     run_date: str = field(default_factory=lambda: datetime.now(tz=_EST).strftime("%Y-%m-%d"))
+    top_n: int = 10
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _annotate_outcome(label: str, question: str) -> str:
+    """Return label with team/school name appended if label is a mascot.
+
+    Searches for the label (case-insensitive, word-boundary) inside the market
+    question.  If the 1-2 words immediately preceding it in the question are not
+    already part of the label, they are the school/city identifier and are
+    appended in brackets.
+
+    Examples
+    --------
+    "Red Storm"     + "St. John's Red Storm vs Marquette" → "Red Storm (St. John's)"
+    "Golden Eagles" + "... vs Marquette Golden Eagles"    → "Golden Eagles (Marquette)"
+    "Lakers"        + "Los Angeles Lakers vs ..."         → "Lakers (Los Angeles)"
+    "YES"           + "Will X win?"                       → "YES"  (no match → unchanged)
+    """
+    if not question or not label:
+        return label
+    label_lc = label.lower()
+    question_lc = question.lower()
+    idx = question_lc.find(label_lc)
+    if idx == -1:
+        return label
+    # Extract the text before the match, split into words, take last 1-2
+    before = question[:idx].strip()
+    prefix_words = before.split()
+    if not prefix_words:
+        return label
+    # Take up to 2 preceding words, skip common filler words
+    fillers = {"will", "the", "a", "an", "vs", "vs.", "beat", "win", "over", "at",
+               "against", "?", "-", "·", "do", "does", "would"}
+    candidates: list[str] = []
+    for w in reversed(prefix_words):
+        if w.lower().rstrip(".,?") in fillers:
+            break
+        candidates.insert(0, w)
+        if len(candidates) == 2:
+            break
+    if not candidates:
+        return label
+    prefix = " ".join(candidates)
+    # Don't annotate if prefix is already contained in the label
+    if prefix.lower() in label_lc:
+        return label
+    return f"{label} ({prefix})"
+
 
 def _parse_json_str(value: str | list | None) -> list:
     if isinstance(value, list):
@@ -1096,6 +1143,7 @@ def display_edge_analysis(
     rows:           list[dict],
     llm_probs:      list[dict],
     edge_threshold: float,
+    question:       str = "",
 ) -> None:
     """Print the edge analysis table and recommend a position if edge is found."""
     if not llm_probs:
@@ -1118,7 +1166,8 @@ def display_edge_analysis(
                     llm_p = v
                     break
         if llm_p is not None:
-            matched.append((row["outcome"], row["implied_prob"], llm_p))
+            display_label = _annotate_outcome(row["outcome"], question)
+            matched.append((display_label, row["implied_prob"], llm_p))
 
     if not matched:
         print("  [Edge Analysis] No matching outcomes between market data and LLM output.\n")
@@ -1166,7 +1215,7 @@ def display_edge_analysis(
         print(f"\n  No edge detected above threshold ({edge_threshold:.1f}%).\n")
 
 
-def display_ev_analysis(rows: list[dict], llm_probs: list[dict]) -> None:
+def display_ev_analysis(rows: list[dict], llm_probs: list[dict], question: str = "") -> None:
     """Print EV per $1 contract for each outcome using LLM probability estimates."""
     if not llm_probs:
         return
@@ -1182,12 +1231,13 @@ def display_ev_analysis(rows: list[dict], llm_probs: list[dict]) -> None:
         label = row.get("outcome", "")
         price = row.get("price", 0.0)
         key   = label.lower()
+        display_label = _annotate_outcome(label, question)
         if key in llm_map:
-            matched.append((label, price, llm_map[key]))
+            matched.append((display_label, price, llm_map[key]))
         else:
             for lk, lp in llm_map.items():
                 if lk in key or key in lk:
-                    matched.append((label, price, lp))
+                    matched.append((display_label, price, lp))
                     break
 
     if not matched:
@@ -1323,8 +1373,9 @@ def _compute_market_summary(report: ReportData) -> dict:
                     llm_p = v
                     break
         if llm_p is not None:
-            matched_edge.append((label, imp, llm_p))
-            matched_ev.append((label, price, llm_p))
+            display_label = _annotate_outcome(label, question)
+            matched_edge.append((display_label, imp, llm_p))
+            matched_ev.append((display_label, price, llm_p))
 
     # Best edge
     best_edge_label = "—"
@@ -1505,30 +1556,37 @@ def display_consolidated(consolidated: ConsolidatedReport) -> None:
 
     print(f"  {'─' * (W - 4)}")
 
+    top_n = consolidated.top_n
+
     # Top picks by edge
     by_edge = sorted(
         [s for s in summaries if s["best_edge_label"] != "—"],
         key=lambda s: abs(s["best_edge"]),
         reverse=True,
-    )[:3]
+    )[:top_n]
     if by_edge:
-        picks_str = "  ·  ".join(
-            f"{s['question'][:20]} ({s['best_edge']:+.1f}%)" for s in by_edge
-        )
-        print(f"  Top picks by edge  : {picks_str}")
+        print(f"  Top {len(by_edge)} picks by edge  :")
+        for rank, s in enumerate(by_edge, 1):
+            print(
+                f"    #{rank:<2} {s['question'][:32]:<33}"
+                f"edge {s['best_edge']:+.1f}%  "
+                f"{s['recommendation']}"
+            )
 
     # Top picks by EV
     by_ev = sorted(
         [s for s in summaries if s["best_ev"] > 0],
         key=lambda s: s["best_ev"],
         reverse=True,
-    )[:3]
+    )[:top_n]
     if by_ev:
-        picks_str = "  ·  ".join(
-            f"{s['question'][:20]} ({s['best_ev']:+.2f}, {s['ev_recommendation']})"
-            for s in by_ev
-        )
-        print(f"  Top picks by EV    : {picks_str}")
+        print(f"  Top {len(by_ev)} picks by EV    :")
+        for rank, s in enumerate(by_ev, 1):
+            print(
+                f"    #{rank:<2} {s['question'][:32]:<33}"
+                f"EV {s['best_ev']:+.2f}/c  "
+                f"{s['ev_recommendation']}"
+            )
 
     print(f"{'═' * W}\n")
 
@@ -1839,7 +1897,8 @@ def generate_pdf(report: ReportData, output_path: str) -> None:
                         llm_p = v
                         break
             if llm_p is not None:
-                matched.append((row["outcome"], row["implied_prob"], llm_p))
+                display_label = _annotate_outcome(row["outcome"], question)
+                matched.append((display_label, row["implied_prob"], llm_p))
 
         if matched:
             thr = report.edge_threshold
@@ -1936,7 +1995,8 @@ def generate_pdf(report: ReportData, output_path: str) -> None:
                         llm_p = lv
                         break
             if llm_p is not None:
-                ev_matched.append((label, price, llm_p))
+                display_label = _annotate_outcome(label, question)
+                ev_matched.append((display_label, price, llm_p))
 
         if ev_matched:
             ev_header = Table(
@@ -2365,11 +2425,12 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
     story.append(Spacer(1, 0.5 * cm))
 
     # ── SECTION 3: Ranked picks by Edge ──────────────────────────────────────
+    top_n = consolidated.top_n
     by_edge = sorted(
         [s for s in summaries if s["best_edge_label"] != "—"],
         key=lambda s: abs(s["best_edge"]),
         reverse=True,
-    )[:3]
+    )[:top_n]
     if by_edge:
         picks_header = Table(
             [[Paragraph("TOP PICKS BY EDGE", styles["h1"])]],
@@ -2419,7 +2480,7 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
         [s for s in summaries if s["best_ev"] > 0],
         key=lambda s: s["best_ev"],
         reverse=True,
-    )[:3]
+    )[:top_n]
     if by_ev:
         ev_picks_header = Table(
             [[Paragraph("TOP PICKS BY EV", styles["h1"])]],
@@ -2817,8 +2878,9 @@ Examples:
                 final_report = deep_research_pipeline(market, rows, llm_client, metrics)
                 display_deep_research(final_report, provider=args.llm)
                 llm_probs = parse_llm_probabilities(final_report)
-                display_edge_analysis(rows, llm_probs, edge_threshold=args.edge_threshold)
-                display_ev_analysis(rows, llm_probs)
+                display_edge_analysis(rows, llm_probs, edge_threshold=args.edge_threshold,
+                                      question=market.get("question", ""))
+                display_ev_analysis(rows, llm_probs, question=market.get("question", ""))
                 sentiment = parse_sentiment(final_report)
                 display_sentiment_analysis(sentiment)
                 display_run_metrics(metrics)
@@ -2875,6 +2937,7 @@ Examples:
                 reports=collected_reports,
                 edge_threshold=args.edge_threshold,
                 run_date=pdf_date,
+                top_n=args.limit,
             )
             display_consolidated(consolidated)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
