@@ -157,6 +157,27 @@ def _market_end_et_str(market: dict) -> str | None:
         return None
 
 
+def _game_date_from_slug(slug: str) -> dt_date | None:
+    """Extract the game/event date from the end of a sports market slug.
+
+    Polymarket sports slugs typically end with YYYY-MM-DD, e.g.:
+      'aec-cbb-stjohn-marq-2026-02-18' → 2026-02-18
+
+    This is the *game* date, which often differs from the settlement
+    endDate (Polymarket sets the settlement deadline to the following
+    day to allow time for official results).
+
+    Returns None for slugs without a trailing date (e.g. 'btc-100k-2025').
+    """
+    m = re.search(r'(\d{4}-\d{2}-\d{2})$', slug)
+    if m:
+        try:
+            return dt_date.fromisoformat(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Odds conversions
 # ---------------------------------------------------------------------------
@@ -452,13 +473,19 @@ def search_by_date(
         )
         sys.exit(1)
 
-    print(f"\n  Found {len(candidates)} market(s) resolving on {date_str} (ET):\n")
+    print(f"\n  Found {len(candidates)} market(s) with settlement date {date_str} (ET):\n")
     for i, m in enumerate(candidates):
-        marker  = " ◄" if i == pick else ""
-        q       = m.get("question", "Untitled")[:60]
-        cat     = m.get("category", "-")
-        et_str  = _market_end_et_str(m) or str(_market_end_date_est(m))
-        print(f"  [{i}] {q}  [{cat}]  settles {et_str}{marker}")
+        marker        = " ◄" if i == pick else ""
+        q             = m.get("question", "Untitled")[:55]
+        cat           = m.get("category", "-")
+        et_str        = _market_end_et_str(m) or str(_market_end_date_est(m))
+        slug_game_date = _game_date_from_slug(m.get("slug", ""))
+        end_est_date  = _market_end_date_est(m)
+        if slug_game_date and (end_est_date is None or slug_game_date != end_est_date):
+            date_info = f"event {slug_game_date} · settles {et_str}"
+        else:
+            date_info = f"settles {et_str}"
+        print(f"  [{i}] {q}  [{cat}]  {date_info}{marker}")
     print()
 
     if pick is not None:
@@ -548,22 +575,28 @@ def display_odds(market: dict, rows: list[dict], verbose: bool) -> None:
     end_date = _fmt_date(market.get("endDate"))
     desc     = market.get("description", "")
 
-    # Show resolution time in both UTC and full ET (date + time).
-    # Sports markets often have an endDate set to the next afternoon so
-    # Polymarket can process results — showing only the ET date would make a
-    # Feb 18 evening game appear to resolve on Feb 19.  The full ET time
-    # makes the settlement window explicit.
-    resolves_str = f"{end_date} UTC"
-    et_str = _market_end_et_str(market)
+    # Settlement deadline from the API (endDate).
+    # For sports markets Polymarket sets this to the FOLLOWING DAY so there is
+    # time to process official results.  The actual game/event date is embedded
+    # in the slug and shown separately when the two dates differ.
+    et_str        = _market_end_et_str(market)
+    settles_str   = f"{end_date} UTC"
     if et_str:
-        resolves_str += f"  ({et_str})"
+        settles_str += f"  ({et_str})"
+
+    # Game/event date from slug (e.g. 'aec-cbb-stjohn-marq-2026-02-18' → 2026-02-18)
+    slug_game_date    = _game_date_from_slug(slug)
+    end_est_date      = _market_end_date_est(market)
+    has_event_date    = slug_game_date and (end_est_date is None or slug_game_date != end_est_date)
 
     print(f"\n{'=' * 72}")
     print(f"  {question}")
     print(f"{'=' * 72}")
     print(f"  Slug:      {slug}")
     print(f"  Status:    {status}  |  Category: {category}")
-    print(f"  Resolves:  {resolves_str}")
+    if has_event_date:
+        print(f"  Event:     {slug_game_date}  (game date from slug)")
+    print(f"  Settles:   {settles_str}  (market settlement deadline)")
     if desc:
         print(f"  Desc:      {desc[:120]}{'...' if len(desc) > 120 else ''}")
     print()
@@ -721,13 +754,23 @@ def create_llm_client(
 # ---------------------------------------------------------------------------
 
 def _build_market_payload(market: dict, rows: list[dict]) -> dict:
-    return {
+    slug           = market.get("slug", "")
+    slug_game_date = _game_date_from_slug(slug)
+    end_est_date   = _market_end_date_est(market)
+    # Only include event_date when it differs from the settlement date so the
+    # LLM understands the distinction between game day and settlement deadline.
+    event_date_val = (
+        str(slug_game_date)
+        if slug_game_date and (end_est_date is None or slug_game_date != end_est_date)
+        else None
+    )
+    payload: dict = {
         "question":    market.get("question", "Untitled"),
         "description": market.get("description", ""),
         "category":    market.get("category", "-"),
         "status":      _status_label(market),
-        "resolves_utc": _fmt_date(market.get("endDate")),
-        "resolves_et":  _market_end_et_str(market) or "-",
+        "settles_utc": _fmt_date(market.get("endDate")),
+        "settles_et":  _market_end_et_str(market) or "-",
         "outcomes": [
             {
                 "outcome":       r["outcome"],
@@ -741,6 +784,9 @@ def _build_market_payload(market: dict, rows: list[dict]) -> dict:
         ],
         "book_overround": f"{overround([r['implied_prob'] for r in rows]):+.2f}%",
     }
+    if event_date_val:
+        payload["event_date"] = event_date_val
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -1462,13 +1508,20 @@ def generate_pdf(report: ReportData, output_path: str) -> None:
     story.append(Spacer(1, 0.4 * cm))
 
     # ── SECTION 2: Market info card ───────────────────────────────────────────
-    # Show the full ET datetime so settlement time is unambiguous.  Sports
-    # markets commonly have an endDate set to the following afternoon; showing
-    # only the date can make a Feb 18 game look like a Feb 19 event.
-    resolves_str = f"{end_date} UTC"
-    et_str = _market_end_et_str(market)
-    if et_str:
-        resolves_str += f"  ({et_str})"
+    # Show the full ET datetime for the settlement deadline.
+    # For sports markets the settlement is set to the FOLLOWING DAY; also show
+    # the actual game date extracted from the slug when the two differ.
+    pdf_et_str    = _market_end_et_str(market)
+    settles_str   = f"{end_date} UTC"
+    if pdf_et_str:
+        settles_str += f"  ({pdf_et_str})"
+
+    pdf_slug_game_date = _game_date_from_slug(slug)
+    pdf_end_est_date   = _market_end_date_est(market)
+    pdf_has_event_date = (
+        pdf_slug_game_date and
+        (pdf_end_est_date is None or pdf_slug_game_date != pdf_end_est_date)
+    )
 
     info_rows: list[list] = [
         [Paragraph("MARKET INFORMATION", styles["h1"])],
@@ -1492,8 +1545,10 @@ def generate_pdf(report: ReportData, output_path: str) -> None:
         info_cell("Question",  question),
         info_cell("Slug",      slug),
         info_cell("Category",  f"{category}  ·  Status: {status}"),
-        info_cell("Resolves",  resolves_str),
     ]
+    if pdf_has_event_date:
+        detail_data.append(info_cell("Event date", f"{pdf_slug_game_date}  (game date from slug)"))
+    detail_data.append(info_cell("Settles", settles_str + "  (market settlement deadline)"))
     if desc:
         short_desc = (desc[:180] + "…") if len(desc) > 180 else desc
         detail_data.append(info_cell("Description", short_desc))
