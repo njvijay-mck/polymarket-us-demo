@@ -80,11 +80,92 @@ class ReportData:
     metrics: RunMetrics | None = None
     is_deep_research: bool = False
     edge_threshold: float = 5.0
+    summary: dict | None = None      # populated by _compute_market_summary()
+
+
+@dataclass
+class ConsolidatedReport:
+    """Accumulates per-market ReportData objects across a multi-market run."""
+    reports: list[ReportData]
+    edge_threshold: float = 5.0
+    run_date: str = field(default_factory=lambda: datetime.now(tz=_EST).strftime("%Y-%m-%d"))
+    top_n: int = 10
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _extract_vs_teams(question: str) -> list[str]:
+    """Extract [team_a, team_b] from a 'Team A vs. Team B' style question.
+
+    Tries common separators in order.  Returns [] when none match.
+    """
+    for sep in (" vs. ", " vs ", " or ", " / "):
+        parts = re.split(re.escape(sep), question, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2:
+            team1 = parts[0].strip()
+            team2 = parts[1].split("?")[0].strip()
+            # Strip common question preamble from team1
+            for prefix in ("Will ", "Who wins: ", "Who will win: ", "Who will win "):
+                if team1.lower().startswith(prefix.lower()):
+                    team1 = team1[len(prefix):].strip()
+                    break
+            return [team1, team2]
+    return []
+
+
+def _build_outcome_display_labels(rows: list[dict], question: str) -> dict[str, str]:
+    """Return {raw_label: display_label} for every outcome in rows.
+
+    Three cases handled in priority order:
+
+    1. Label exactly equals a team name from the question → keep as-is.
+    2. Label is the mascot suffix of a full team name in the question
+       (e.g. "Lakers" inside "Los Angeles Lakers") → annotate with the
+       city/school prefix: "Lakers (Los Angeles)".
+    3. Label has no textual overlap with any team name (pure mascot like
+       "Wildcats") → positional mapping: outcome[i] → team[i] from the
+       question, yielding "Wildcats (New Hampshire)".
+
+    YES/NO binary markets are always returned unchanged.
+    """
+    labels = [row.get("outcome", "") for row in rows]
+    # Binary YES/NO markets need no annotation
+    if all(lbl.upper() in ("YES", "NO") for lbl in labels):
+        return {lbl: lbl for lbl in labels}
+
+    teams = _extract_vs_teams(question)
+    result: dict[str, str] = {}
+
+    for i, label in enumerate(labels):
+        label_lc = label.lower()
+        annotated = label
+
+        if teams:
+            for team in teams:
+                team_lc = team.lower()
+                # Case 1: exact match — no annotation needed
+                if team_lc == label_lc:
+                    annotated = label
+                    break
+                # Case 2: label is a trailing portion of the full team name
+                if team_lc.endswith(label_lc) and len(team_lc) > len(label_lc):
+                    prefix = team[:team_lc.index(label_lc)].strip()
+                    if prefix:
+                        annotated = f"{label} ({prefix})"
+                    break
+            else:
+                # Case 3: label not found in any team name — use position
+                if i < len(teams):
+                    team = teams[i]
+                    if team.lower() != label_lc:
+                        annotated = f"{label} ({team})"
+
+        result[label] = annotated
+
+    return result
+
 
 def _parse_json_str(value: str | list | None) -> list:
     if isinstance(value, list):
@@ -1087,6 +1168,7 @@ def display_edge_analysis(
     rows:           list[dict],
     llm_probs:      list[dict],
     edge_threshold: float,
+    question:       str = "",
 ) -> None:
     """Print the edge analysis table and recommend a position if edge is found."""
     if not llm_probs:
@@ -1099,6 +1181,7 @@ def display_edge_analysis(
         if "outcome" in item and "llm_probability" in item
     }
 
+    label_map = _build_outcome_display_labels(rows, question)
     matched: list[tuple[str, float, float]] = []
     for row in rows:
         key   = row["outcome"].lower()
@@ -1109,7 +1192,8 @@ def display_edge_analysis(
                     llm_p = v
                     break
         if llm_p is not None:
-            matched.append((row["outcome"], row["implied_prob"], llm_p))
+            display_label = label_map.get(row["outcome"], row["outcome"])
+            matched.append((display_label, row["implied_prob"], llm_p))
 
     if not matched:
         print("  [Edge Analysis] No matching outcomes between market data and LLM output.\n")
@@ -1157,7 +1241,7 @@ def display_edge_analysis(
         print(f"\n  No edge detected above threshold ({edge_threshold:.1f}%).\n")
 
 
-def display_ev_analysis(rows: list[dict], llm_probs: list[dict]) -> None:
+def display_ev_analysis(rows: list[dict], llm_probs: list[dict], question: str = "") -> None:
     """Print EV per $1 contract for each outcome using LLM probability estimates."""
     if not llm_probs:
         return
@@ -1168,17 +1252,19 @@ def display_ev_analysis(rows: list[dict], llm_probs: list[dict]) -> None:
         if "outcome" in item and "llm_probability" in item
     }
 
+    label_map = _build_outcome_display_labels(rows, question)
     matched: list[tuple[str, float, float]] = []
     for row in rows:
         label = row.get("outcome", "")
         price = row.get("price", 0.0)
         key   = label.lower()
+        display_label = label_map.get(label, label)
         if key in llm_map:
-            matched.append((label, price, llm_map[key]))
+            matched.append((display_label, price, llm_map[key]))
         else:
             for lk, lp in llm_map.items():
                 if lk in key or key in lk:
-                    matched.append((label, price, lp))
+                    matched.append((display_label, price, lp))
                     break
 
     if not matched:
@@ -1277,6 +1363,103 @@ def display_sentiment_analysis(sentiment: dict | None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-market summary computation (used by consolidated report)
+# ---------------------------------------------------------------------------
+
+def _compute_market_summary(report: ReportData) -> dict:
+    """Derive a one-row summary dict from a ReportData without any LLM calls."""
+    market    = report.market
+    rows      = report.rows
+    llm_probs = report.llm_probs
+    sentiment = report.sentiment
+    threshold = report.edge_threshold
+
+    question = market.get("question", "Untitled")
+    slug     = market.get("slug", "")
+    q_short  = question[:60] + ("..." if len(question) > 60 else "")
+
+    # Build outcome->prob map from llm_probs (same matching logic as display_edge_analysis)
+    llm_map: dict[str, float] = {
+        item["outcome"].lower(): float(item["llm_probability"])
+        for item in llm_probs
+        if "outcome" in item and "llm_probability" in item
+    }
+
+    # Match rows to llm_map
+    label_map = _build_outcome_display_labels(rows, question)
+    matched_edge: list[tuple[str, float, float]] = []   # (label, market_p, llm_p)
+    matched_ev:   list[tuple[str, float, float]] = []   # (label, price, llm_p)
+    for row in rows:
+        label   = row.get("outcome", "")
+        price   = row.get("price", 0.0)
+        imp     = row.get("implied_prob", price)
+        key     = label.lower()
+        llm_p   = llm_map.get(key)
+        if llm_p is None:
+            for k, v in llm_map.items():
+                if k in key or key in k:
+                    llm_p = v
+                    break
+        if llm_p is not None:
+            display_label = label_map.get(label, label)
+            matched_edge.append((display_label, imp, llm_p))
+            matched_ev.append((display_label, price, llm_p))
+
+    # Best edge
+    best_edge_label = "—"
+    best_edge       = 0.0
+    for label, market_p, llm_p in matched_edge:
+        edge = (llm_p - market_p) * 100
+        if abs(edge) > abs(best_edge):
+            best_edge       = edge
+            best_edge_label = label
+
+    # Best EV
+    best_ev_label = "—"
+    best_ev       = 0.0
+    best_ev_price = 0.0
+    roi           = 0.0
+    for label, price, llm_p in matched_ev:
+        ev = llm_p - price
+        if ev > best_ev:
+            best_ev       = ev
+            best_ev_label = label
+            best_ev_price = price
+            roi           = (ev / price * 100) if price > 0 else 0.0
+
+    # Sentiment
+    sent_label = None
+    sent_score = None
+    if sentiment:
+        sent_label = sentiment.get("overall", "neutral")
+        sent_score = float(sentiment.get("score", 0.5))
+
+    # Edge-based recommendation (requires threshold)
+    recommendation = "—"
+    if best_edge_label != "—" and abs(best_edge) >= threshold:
+        direction      = "BUY" if best_edge > 0 else "SELL"
+        recommendation = f"{direction} {best_edge_label.upper()}"
+
+    # EV-based recommendation (independent of edge threshold)
+    ev_recommendation = f"BUY {best_ev_label.upper()}" if best_ev > 0 else "—"
+
+    return {
+        "question":          q_short,
+        "slug":              slug,
+        "best_edge_label":   best_edge_label,
+        "best_edge":         best_edge,
+        "best_ev_label":     best_ev_label,
+        "best_ev":           best_ev,
+        "best_ev_price":     best_ev_price,
+        "roi":               roi,
+        "sentiment":         sent_label,
+        "sentiment_score":   sent_score,
+        "recommendation":    recommendation,
+        "ev_recommendation": ev_recommendation,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Run metrics summary
 # ---------------------------------------------------------------------------
 
@@ -1332,13 +1515,108 @@ def display_run_metrics(metrics: RunMetrics) -> None:
 # PDF report generation
 # ---------------------------------------------------------------------------
 
-def _resolve_pdf_path(arg: str, market: dict) -> str:
-    """Return the PDF output path: user-supplied name, or auto-generated."""
+def _reports_dir(date_str: str | None = None) -> str:
+    """Return (and create) reports/YYYY-MM-DD/ under cwd."""
+    d = date_str or datetime.now(tz=_EST).strftime("%Y-%m-%d")
+    path = os.path.join("reports", d)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _resolve_pdf_path(arg: str, market: dict, date_str: str | None = None) -> str:
+    """Return the PDF output path inside the dated reports subfolder."""
+    base_dir = _reports_dir(date_str)
     if arg and arg != "auto":
-        return arg
+        return os.path.join(base_dir, os.path.basename(arg))
     slug = market.get("slug", "market")
     ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{slug}_{ts}.pdf"
+    return os.path.join(base_dir, f"{slug}_{ts}.pdf")
+
+
+def display_consolidated(consolidated: ConsolidatedReport) -> None:
+    """Print a consolidated summary table after a multi-market run."""
+    reports   = consolidated.reports
+    threshold = consolidated.edge_threshold
+    run_date  = consolidated.run_date
+    n         = len(reports)
+
+    summaries = [r.summary for r in reports if r.summary]
+    if not summaries:
+        return
+
+    W = 72
+    C_Q, C_E, C_EV, C_S, C_R = 32, 13, 11, 10, 12
+
+    print(f"\n{'═' * W}")
+    header = f"  CONSOLIDATED SUMMARY — {run_date}  ({n} market{'s' if n != 1 else ''})"
+    print(header)
+    print(f"{'═' * W}")
+
+    col_hdr = (
+        f"  {'Market':<{C_Q}}"
+        f"{'Best Edge':<{C_E}}"
+        f"{'Best EV':<{C_EV}}"
+        f"{'Sentiment':<{C_S}}"
+        f"{'Rec':<{C_R}}"
+    )
+    print(col_hdr)
+    print(f"  {'─' * (W - 4)}")
+
+    for s in summaries:
+        edge_val   = s["best_edge"]
+        edge_arrow = "▲" if edge_val > 0 else "▼"
+        edge_str   = f"{s['best_edge_label']} {edge_val:+.1f}%{edge_arrow}" if s["best_edge_label"] != "—" else "—"
+
+        ev_val  = s["best_ev"]
+        ev_str  = f"{ev_val:+.2f}/c" if s["best_ev_label"] != "—" else "—"
+
+        sent_str = (s["sentiment"] or "—").capitalize()
+        rec_str  = s["recommendation"]
+        q_str    = s["question"][:C_Q]
+
+        print(
+            f"  {q_str:<{C_Q}}"
+            f"{edge_str:<{C_E}}"
+            f"{ev_str:<{C_EV}}"
+            f"{sent_str:<{C_S}}"
+            f"{rec_str:<{C_R}}"
+        )
+
+    print(f"  {'─' * (W - 4)}")
+
+    top_n = consolidated.top_n
+
+    # Top picks by edge
+    by_edge = sorted(
+        [s for s in summaries if s["best_edge_label"] != "—"],
+        key=lambda s: abs(s["best_edge"]),
+        reverse=True,
+    )[:top_n]
+    if by_edge:
+        print(f"  Top {len(by_edge)} picks by edge  :")
+        for rank, s in enumerate(by_edge, 1):
+            print(
+                f"    #{rank:<2} {s['question'][:32]:<33}"
+                f"edge {s['best_edge']:+.1f}%  "
+                f"{s['recommendation']}"
+            )
+
+    # Top picks by EV
+    by_ev = sorted(
+        [s for s in summaries if s["best_ev"] > 0],
+        key=lambda s: s["best_ev"],
+        reverse=True,
+    )[:top_n]
+    if by_ev:
+        print(f"  Top {len(by_ev)} picks by EV    :")
+        for rank, s in enumerate(by_ev, 1):
+            print(
+                f"    #{rank:<2} {s['question'][:32]:<33}"
+                f"EV {s['best_ev']:+.2f}/c  "
+                f"{s['ev_recommendation']}"
+            )
+
+    print(f"{'═' * W}\n")
 
 
 def _md_to_paragraphs(text: str, styles: Any) -> list:
@@ -1637,6 +1915,7 @@ def generate_pdf(report: ReportData, output_path: str) -> None:
             item["outcome"].lower(): float(item["llm_probability"])
             for item in report.llm_probs
         }
+        label_map_edge = _build_outcome_display_labels(rows, question)
         matched: list[tuple[str, float, float]] = []
         for row in rows:
             key   = row["outcome"].lower()
@@ -1647,7 +1926,8 @@ def generate_pdf(report: ReportData, output_path: str) -> None:
                         llm_p = v
                         break
             if llm_p is not None:
-                matched.append((row["outcome"], row["implied_prob"], llm_p))
+                display_label = label_map_edge.get(row["outcome"], row["outcome"])
+                matched.append((display_label, row["implied_prob"], llm_p))
 
         if matched:
             thr = report.edge_threshold
@@ -1732,6 +2012,7 @@ def generate_pdf(report: ReportData, output_path: str) -> None:
             item["outcome"].lower(): float(item["llm_probability"])
             for item in report.llm_probs
         }
+        label_map_ev = _build_outcome_display_labels(rows, question)
         ev_matched: list[tuple[str, float, float]] = []
         for row in rows:
             label = row.get("outcome", "")
@@ -1744,7 +2025,8 @@ def generate_pdf(report: ReportData, output_path: str) -> None:
                         llm_p = lv
                         break
             if llm_p is not None:
-                ev_matched.append((label, price, llm_p))
+                display_label = label_map_ev.get(label, label)
+                ev_matched.append((display_label, price, llm_p))
 
         if ev_matched:
             ev_header = Table(
@@ -1981,6 +2263,456 @@ def generate_pdf(report: ReportData, output_path: str) -> None:
     doc.build(story)
 
 
+def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str) -> None:
+    """Render a consolidated multi-market PDF using reportlab Platypus."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.lib.enums import TA_LEFT, TA_CENTER
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Table, TableStyle,
+            Spacer, HRFlowable, KeepTogether,
+        )
+    except ImportError:
+        print(
+            "\n  [PDF] reportlab is not installed.\n"
+            "  Run: uv sync   (it is listed in pyproject.toml)",
+            file=sys.stderr,
+        )
+        return
+
+    # ── Color palette (same as generate_pdf) ─────────────────────────────────
+    C_NAVY  = colors.HexColor("#1a3a5c")
+    C_BLUE  = colors.HexColor("#2e6da4")
+    C_GOLD  = colors.HexColor("#c8922a")
+    C_ALT   = colors.HexColor("#eef3f8")
+    C_LGRAY = colors.HexColor("#d8e2ec")
+    C_GREEN = colors.HexColor("#1e7e34")
+    C_RED   = colors.HexColor("#c0392b")
+    C_TEXT  = colors.HexColor("#1a1a2e")
+    C_WHITE = colors.white
+
+    # ── Paragraph styles ─────────────────────────────────────────────────────
+    base   = getSampleStyleSheet()
+    normal = base["Normal"]
+
+    def ps(name: str, **kw) -> ParagraphStyle:
+        return ParagraphStyle(name + "_c", parent=normal, **kw)
+
+    styles = {
+        "title":    ps("title",   fontSize=18, textColor=C_WHITE, fontName="Helvetica-Bold",
+                        spaceAfter=2, leading=22),
+        "subtitle": ps("subtitle", fontSize=9, textColor=C_LGRAY, fontName="Helvetica",
+                        spaceAfter=0),
+        "h1":       ps("h1",      fontSize=12, textColor=C_WHITE, fontName="Helvetica-Bold",
+                        spaceBefore=4, spaceAfter=4, leading=16),
+        "h2":       ps("h2",      fontSize=10, textColor=C_NAVY, fontName="Helvetica-Bold",
+                        spaceBefore=6, spaceAfter=3),
+        "body":     ps("body",    fontSize=9, textColor=C_TEXT, fontName="Helvetica",
+                        leading=13, spaceAfter=2),
+        "small":    ps("small",   fontSize=7.5, textColor=colors.HexColor("#555577"),
+                        fontName="Helvetica"),
+        "bold":     ps("bold",    fontSize=9, textColor=C_TEXT, fontName="Helvetica-Bold"),
+    }
+
+    def header_row_style(row: int, bg: object = C_NAVY) -> list:
+        return [
+            ("BACKGROUND", (0, row), (-1, row), bg),
+            ("TEXTCOLOR",  (0, row), (-1, row), C_WHITE),
+            ("FONTNAME",   (0, row), (-1, row), "Helvetica-Bold"),
+            ("FONTSIZE",   (0, row), (-1, row), 8.5),
+            ("TOPPADDING", (0, row), (-1, row), 5),
+            ("BOTTOMPADDING", (0, row), (-1, row), 5),
+        ]
+
+    def grid_style() -> list:
+        return [
+            ("GRID",         (0, 0), (-1, -1), 0.4, C_LGRAY),
+            ("ROWBACKGROUNDS",(0, 0), (-1, -1), [C_WHITE, C_ALT]),
+        ]
+
+    # ── Document setup ────────────────────────────────────────────────────────
+    doc = SimpleDocTemplate(
+        output_path,
+        pagesize=A4,
+        leftMargin=1.8 * cm,
+        rightMargin=1.8 * cm,
+        topMargin=1.5 * cm,
+        bottomMargin=1.8 * cm,
+        title="Polymarket Consolidated Market Report",
+        author="09_odds_calculator.py",
+    )
+    W = doc.width
+    story: list = []
+
+    run_date  = consolidated.run_date
+    threshold = consolidated.edge_threshold
+    summaries = [r.summary for r in consolidated.reports if r.summary]
+    n         = len(summaries)
+    gen_ts    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Gather provider/model/pipeline from first report's metrics for subtitle
+    first_metrics = next(
+        (r.metrics for r in consolidated.reports if r.metrics), None
+    )
+    pipeline_info = ""
+    if first_metrics:
+        model_part = f"  ({first_metrics.model})" if first_metrics.model else ""
+        pipeline_info = (
+            f"{first_metrics.provider}{model_part}  ·  {first_metrics.pipeline}"
+        )
+
+    # ── SECTION 1: Title banner ───────────────────────────────────────────────
+    banner_data = [
+        [Paragraph(f"CONSOLIDATED MARKET REPORT — {run_date}", styles["title"])],
+        [Paragraph(
+            f"Generated {gen_ts}  ·  {n} markets  ·  {pipeline_info}",
+            styles["subtitle"],
+        )],
+    ]
+    banner_table = Table(banner_data, colWidths=[W])
+    banner_table.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, -1), C_NAVY),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 12),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 12),
+        ("TOPPADDING",    (0, 0), (0, 0),   10),
+        ("BOTTOMPADDING", (0, 0), (0, 0),   2),
+        ("TOPPADDING",    (0, 1), (0, 1),   2),
+        ("BOTTOMPADDING", (0, 1), (0, 1),   10),
+        ("LINEBELOW",     (0, -1), (-1, -1), 3, C_GOLD),
+    ]))
+    story.append(banner_table)
+    story.append(Spacer(1, 0.4 * cm))
+
+    # ── SECTION 2: Summary table ──────────────────────────────────────────────
+    sum_header = Table(
+        [[Paragraph("SUMMARY TABLE", styles["h1"])]],
+        colWidths=[W],
+    )
+    sum_header.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, -1), C_BLUE),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+        ("TOPPADDING",   (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+    ]))
+    story.append(sum_header)
+
+    col_w = [W * f for f in [0.32, 0.15, 0.13, 0.16, 0.13, 0.11]]
+    sum_data: list[list] = [[
+        Paragraph("<b>Market</b>",         styles["small"]),
+        Paragraph("<b>Best Edge</b>",      styles["small"]),
+        Paragraph("<b>Best EV</b>",        styles["small"]),
+        Paragraph("<b>Sentiment</b>",      styles["small"]),
+        Paragraph("<b>ROI</b>",            styles["small"]),
+        Paragraph("<b>Rec</b>",            styles["small"]),
+    ]]
+    for s in summaries:
+        edge_val   = s["best_edge"]
+        edge_arrow = "▲" if edge_val > 0 else "▼"
+        edge_str   = (
+            f"{s['best_edge_label']} {edge_val:+.1f}%{edge_arrow}"
+            if s["best_edge_label"] != "—" else "—"
+        )
+        ev_val  = s["best_ev"]
+        ev_str  = f"{ev_val:+.2f}/c" if s["best_ev_label"] != "—" else "—"
+        roi_str = f"{s['roi']:+.1f}%" if s["best_ev_label"] != "—" else "—"
+        sent_str = (s["sentiment"] or "—").capitalize()
+
+        sum_data.append([
+            Paragraph(s["question"], styles["body"]),
+            Paragraph(edge_str,      styles["body"]),
+            Paragraph(ev_str,        styles["body"]),
+            Paragraph(sent_str,      styles["body"]),
+            Paragraph(roi_str,       styles["body"]),
+            Paragraph(s["recommendation"], styles["body"]),
+        ])
+
+    sum_table = Table(sum_data, colWidths=col_w)
+    sum_cmds = header_row_style(0, C_NAVY) + grid_style() + [
+        ("FONTNAME",   (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE",   (0, 1), (-1, -1), 8.5),
+        ("TOPPADDING", (0, 1), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
+        ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+    ]
+    # Colour edge column
+    for i, s in enumerate(summaries):
+        row = i + 1
+        edge_val = s["best_edge"]
+        if s["best_edge_label"] != "—":
+            clr = C_GREEN if edge_val > 0 else C_RED
+            sum_cmds.append(("TEXTCOLOR", (1, row), (1, row), clr))
+            sum_cmds.append(("FONTNAME",  (1, row), (1, row), "Helvetica-Bold"))
+        if s["best_ev"] > 0:
+            sum_cmds.append(("TEXTCOLOR", (2, row), (2, row), C_GREEN))
+            sum_cmds.append(("FONTNAME",  (2, row), (2, row), "Helvetica-Bold"))
+    sum_table.setStyle(TableStyle(sum_cmds))
+    story.append(sum_table)
+    story.append(Spacer(1, 0.5 * cm))
+
+    # ── SECTION 3: Ranked picks by Edge ──────────────────────────────────────
+    top_n = consolidated.top_n
+    by_edge = sorted(
+        [s for s in summaries if s["best_edge_label"] != "—"],
+        key=lambda s: abs(s["best_edge"]),
+        reverse=True,
+    )[:top_n]
+    if by_edge:
+        picks_header = Table(
+            [[Paragraph("TOP PICKS BY EDGE", styles["h1"])]],
+            colWidths=[W],
+        )
+        picks_header.setStyle(TableStyle([
+            ("BACKGROUND",   (0, 0), (-1, -1), C_NAVY),
+            ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+            ("TOPPADDING",   (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+        ]))
+        story.append(picks_header)
+        picks_data = [[
+            Paragraph("<b>Rank</b>",  styles["small"]),
+            Paragraph("<b>Market</b>", styles["small"]),
+            Paragraph("<b>Edge</b>",  styles["small"]),
+            Paragraph("<b>Rec</b>",   styles["small"]),
+        ]]
+        for i, s in enumerate(by_edge, 1):
+            edge_val  = s["best_edge"]
+            edge_str  = f"{s['best_edge_label']} {edge_val:+.1f}%"
+            picks_data.append([
+                Paragraph(f"#{i}", styles["body"]),
+                Paragraph(s["question"], styles["body"]),
+                Paragraph(edge_str, styles["body"]),
+                Paragraph(s["recommendation"], styles["body"]),
+            ])
+        pe_table = Table(picks_data, colWidths=[W * f for f in [0.07, 0.52, 0.22, 0.19]])
+        pe_cmds = header_row_style(0, C_NAVY) + grid_style() + [
+            ("FONTNAME",   (0, 1), (-1, -1), "Helvetica"),
+            ("FONTSIZE",   (0, 1), (-1, -1), 8.5),
+            ("TOPPADDING", (0, 1), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+            ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+        ]
+        for i, s in enumerate(by_edge, 1):
+            clr = C_GREEN if s["best_edge"] > 0 else C_RED
+            pe_cmds.append(("TEXTCOLOR", (2, i), (2, i), clr))
+            pe_cmds.append(("FONTNAME",  (2, i), (2, i), "Helvetica-Bold"))
+        pe_table.setStyle(TableStyle(pe_cmds))
+        story.append(pe_table)
+        story.append(Spacer(1, 0.4 * cm))
+
+    # ── SECTION 4: Ranked picks by EV ────────────────────────────────────────
+    by_ev = sorted(
+        [s for s in summaries if s["best_ev"] > 0],
+        key=lambda s: s["best_ev"],
+        reverse=True,
+    )[:top_n]
+    if by_ev:
+        ev_picks_header = Table(
+            [[Paragraph("TOP PICKS BY EV", styles["h1"])]],
+            colWidths=[W],
+        )
+        ev_picks_header.setStyle(TableStyle([
+            ("BACKGROUND",   (0, 0), (-1, -1), C_NAVY),
+            ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+            ("TOPPADDING",   (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+        ]))
+        story.append(ev_picks_header)
+        ev_picks_data = [[
+            Paragraph("<b>Rank</b>",   styles["small"]),
+            Paragraph("<b>Market</b>", styles["small"]),
+            Paragraph("<b>EV/c</b>",   styles["small"]),
+            Paragraph("<b>ROI</b>",    styles["small"]),
+            Paragraph("<b>Rec</b>",    styles["small"]),
+        ]]
+        for i, s in enumerate(by_ev, 1):
+            ev_picks_data.append([
+                Paragraph(f"#{i}",                   styles["body"]),
+                Paragraph(s["question"],             styles["body"]),
+                Paragraph(f"{s['best_ev']:+.3f}",    styles["body"]),
+                Paragraph(f"{s['roi']:+.1f}%",       styles["body"]),
+                Paragraph(s["ev_recommendation"],    styles["body"]),
+            ])
+        pev_table = Table(ev_picks_data, colWidths=[W * f for f in [0.07, 0.50, 0.13, 0.13, 0.17]])
+        pev_cmds = header_row_style(0, C_NAVY) + grid_style() + [
+            ("FONTNAME",   (0, 1), (-1, -1), "Helvetica"),
+            ("FONTSIZE",   (0, 1), (-1, -1), 8.5),
+            ("TOPPADDING", (0, 1), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+            ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+        ]
+        for i in range(1, len(by_ev) + 1):
+            pev_cmds.append(("TEXTCOLOR", (2, i), (4, i), C_GREEN))
+            pev_cmds.append(("FONTNAME",  (2, i), (4, i), "Helvetica-Bold"))
+        pev_table.setStyle(TableStyle(pev_cmds))
+        story.append(pev_table)
+        story.append(Spacer(1, 0.4 * cm))
+
+    # ── SECTION 5: Markets to avoid ──────────────────────────────────────────
+    avoid = [
+        s for s in summaries
+        if s["best_edge_label"] == "—" or (
+            abs(s["best_edge"]) < threshold and s["best_ev"] <= 0
+        )
+    ]
+    if avoid:
+        avoid_header = Table(
+            [[Paragraph("MARKETS TO AVOID  (no edge / no positive EV)", styles["h1"])]],
+            colWidths=[W],
+        )
+        avoid_header.setStyle(TableStyle([
+            ("BACKGROUND",   (0, 0), (-1, -1), colors.HexColor("#8b1a1a")),
+            ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+            ("TOPPADDING",   (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+        ]))
+        story.append(avoid_header)
+        avoid_data: list[list] = []
+        for s in avoid:
+            avoid_data.append([
+                Paragraph(s["question"], styles["body"]),
+                Paragraph(
+                    f"Edge: {s['best_edge']:+.1f}%  |  EV: {s['best_ev']:+.2f}/c",
+                    styles["small"],
+                ),
+            ])
+        av_table = Table(avoid_data, colWidths=[W * 0.60, W * 0.40])
+        av_table.setStyle(TableStyle([
+            ("FONTSIZE",     (0, 0), (-1, -1), 8.5),
+            ("TOPPADDING",   (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING",(0, 0), (-1, -1), 4),
+            ("LEFTPADDING",  (0, 0), (-1, -1), 6),
+            ("GRID",         (0, 0), (-1, -1), 0.4, C_LGRAY),
+            ("ROWBACKGROUNDS",(0, 0), (-1, -1), [C_WHITE, C_ALT]),
+            ("TEXTCOLOR",    (0, 0), (-1, -1), colors.HexColor("#8b1a1a")),
+            ("LINEBELOW",    (0, -1), (-1, -1), 1.5, colors.HexColor("#8b1a1a")),
+        ]))
+        story.append(av_table)
+        story.append(Spacer(1, 0.4 * cm))
+
+    # ── SECTION 6: Mini odds per market ──────────────────────────────────────
+    mini_header = Table(
+        [[Paragraph("MINI ODDS OVERVIEW  (per market)", styles["h1"])]],
+        colWidths=[W],
+    )
+    mini_header.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, -1), C_BLUE),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+        ("TOPPADDING",   (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+    ]))
+    story.append(mini_header)
+    story.append(Spacer(1, 0.2 * cm))
+
+    llm_col_w = [W * f for f in [0.24, 0.14, 0.14, 0.14, 0.18, 0.16]]
+    for report in consolidated.reports:
+        if not report.rows:
+            continue
+        mkt_q = report.market.get("question", "Untitled")
+        story.append(Paragraph(f"<b>{mkt_q}</b>", styles["h2"]))
+
+        llm_map = {}
+        if report.llm_probs:
+            llm_map = {
+                item["outcome"].lower(): float(item["llm_probability"])
+                for item in report.llm_probs
+                if "outcome" in item and "llm_probability" in item
+            }
+
+        mini_data: list[list] = [[
+            Paragraph("<b>Outcome</b>",  styles["small"]),
+            Paragraph("<b>Market%</b>",  styles["small"]),
+            Paragraph("<b>LLM%</b>",     styles["small"]),
+            Paragraph("<b>Edge</b>",     styles["small"]),
+            Paragraph("<b>EV/c</b>",     styles["small"]),
+            Paragraph("<b>ROI</b>",      styles["small"]),
+        ]]
+        mini_cmds = header_row_style(0, C_BLUE) + grid_style() + [
+            ("FONTNAME",   (0, 1), (-1, -1), "Helvetica"),
+            ("FONTSIZE",   (0, 1), (-1, -1), 8),
+            ("TOPPADDING", (0, 1), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 1), (-1, -1), 3),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 5),
+            ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+        ]
+        mini_label_map = _build_outcome_display_labels(
+            report.rows, report.market.get("question", "")
+        )
+        for row_i, row in enumerate(report.rows, 1):
+            label  = row.get("outcome", "")
+            price  = row.get("price", 0.0)
+            imp    = row.get("implied_prob", price)
+            key    = label.lower()
+            llm_p  = llm_map.get(key)
+            if llm_p is None:
+                for lk, lv in llm_map.items():
+                    if lk in key or key in lk:
+                        llm_p = lv
+                        break
+            display_label = mini_label_map.get(label, label)
+
+            if llm_p is not None:
+                edge = (llm_p - imp) * 100
+                ev   = llm_p - price
+                roi  = (ev / price * 100) if price > 0 else 0.0
+                edge_arrow = "▲" if edge > 0 else "▼"
+                mini_data.append([
+                    Paragraph(display_label, styles["small"]),
+                    Paragraph(f"{imp * 100:.1f}%",   styles["small"]),
+                    Paragraph(f"{llm_p * 100:.1f}%", styles["small"]),
+                    Paragraph(f"{edge:+.1f}%{edge_arrow}", styles["small"]),
+                    Paragraph(f"{ev:+.3f}",          styles["small"]),
+                    Paragraph(f"{roi:+.1f}%",        styles["small"]),
+                ])
+                clr_e = C_GREEN if edge > 0 else C_RED
+                clr_v = C_GREEN if ev > 0 else C_RED
+                mini_cmds.append(("TEXTCOLOR", (3, row_i), (3, row_i), clr_e))
+                mini_cmds.append(("FONTNAME",  (3, row_i), (3, row_i), "Helvetica-Bold"))
+                mini_cmds.append(("TEXTCOLOR", (4, row_i), (5, row_i), clr_v))
+            else:
+                mini_data.append([
+                    Paragraph(display_label, styles["small"]),
+                    Paragraph(f"{imp * 100:.1f}%", styles["small"]),
+                    Paragraph("—", styles["small"]),
+                    Paragraph("—", styles["small"]),
+                    Paragraph("—", styles["small"]),
+                    Paragraph("—", styles["small"]),
+                ])
+
+        mini_table = Table(mini_data, colWidths=llm_col_w)
+        mini_table.setStyle(TableStyle(mini_cmds))
+        story.append(mini_table)
+        story.append(Spacer(1, 0.3 * cm))
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.3 * cm))
+    footer_table = Table(
+        [[Paragraph(
+            "Generated by 09_odds_calculator.py  ·  Polymarket US API demo  ·  "
+            "For informational purposes only",
+            styles["small"],
+        )]],
+        colWidths=[W],
+    )
+    footer_table.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, -1), C_NAVY),
+        ("TEXTCOLOR",    (0, 0), (-1, -1), C_LGRAY),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+        ("TOPPADDING",   (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+        ("LINEABOVE",    (0, 0), (-1, -1), 3, C_GOLD),
+    ]))
+    story.append(footer_table)
+
+    doc.build(story)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -2132,6 +2864,9 @@ Examples:
             )
 
         # -- Analyse each market -----------------------------------------------
+        collected_reports: list[ReportData] = []
+        pdf_date = datetime.now(tz=_EST).strftime("%Y-%m-%d")
+
         for idx, market in enumerate(markets):
             metrics = RunMetrics()
 
@@ -2160,11 +2895,11 @@ Examples:
                 print("  (LLM analysis skipped — run without --no-llm to enable)\n")
                 display_run_metrics(metrics)
                 if args.pdf:
-                    pdf_path = _resolve_pdf_path(args.pdf, market)
-                    generate_pdf(
-                        ReportData(market=market, rows=rows, metrics=metrics),
-                        pdf_path,
-                    )
+                    report_data = ReportData(market=market, rows=rows, metrics=metrics)
+                    report_data.summary = _compute_market_summary(report_data)
+                    collected_reports.append(report_data)
+                    pdf_path = _resolve_pdf_path(args.pdf, market, pdf_date)
+                    generate_pdf(report_data, pdf_path)
                     print(f"  PDF saved: {pdf_path}\n")
                 continue
 
@@ -2177,26 +2912,27 @@ Examples:
                 final_report = deep_research_pipeline(market, rows, llm_client, metrics)
                 display_deep_research(final_report, provider=args.llm)
                 llm_probs = parse_llm_probabilities(final_report)
-                display_edge_analysis(rows, llm_probs, edge_threshold=args.edge_threshold)
-                display_ev_analysis(rows, llm_probs)
+                display_edge_analysis(rows, llm_probs, edge_threshold=args.edge_threshold,
+                                      question=market.get("question", ""))
+                display_ev_analysis(rows, llm_probs, question=market.get("question", ""))
                 sentiment = parse_sentiment(final_report)
                 display_sentiment_analysis(sentiment)
                 display_run_metrics(metrics)
+                report_data = ReportData(
+                    market=market,
+                    rows=rows,
+                    analysis_text=final_report,
+                    llm_probs=llm_probs,
+                    sentiment=sentiment,
+                    metrics=metrics,
+                    is_deep_research=True,
+                    edge_threshold=args.edge_threshold,
+                )
+                report_data.summary = _compute_market_summary(report_data)
+                collected_reports.append(report_data)
                 if args.pdf:
-                    pdf_path = _resolve_pdf_path(args.pdf, market)
-                    generate_pdf(
-                        ReportData(
-                            market=market,
-                            rows=rows,
-                            analysis_text=final_report,
-                            llm_probs=llm_probs,
-                            sentiment=sentiment,
-                            metrics=metrics,
-                            is_deep_research=True,
-                            edge_threshold=args.edge_threshold,
-                        ),
-                        pdf_path,
-                    )
+                    pdf_path = _resolve_pdf_path(args.pdf, market, pdf_date)
+                    generate_pdf(report_data, pdf_path)
                     print(f"  PDF saved: {pdf_path}\n")
             else:
                 metrics.pipeline = "single-pass"
@@ -2215,19 +2951,33 @@ Examples:
                 analysis = llm_analysis(market, rows, llm_client, web_context=web_context)
                 display_llm_analysis(analysis, provider=args.llm)
                 display_run_metrics(metrics)
+                report_data = ReportData(
+                    market=market,
+                    rows=rows,
+                    analysis_text=analysis,
+                    metrics=metrics,
+                    is_deep_research=False,
+                )
+                report_data.summary = _compute_market_summary(report_data)
+                collected_reports.append(report_data)
                 if args.pdf:
-                    pdf_path = _resolve_pdf_path(args.pdf, market)
-                    generate_pdf(
-                        ReportData(
-                            market=market,
-                            rows=rows,
-                            analysis_text=analysis,
-                            metrics=metrics,
-                            is_deep_research=False,
-                        ),
-                        pdf_path,
-                    )
+                    pdf_path = _resolve_pdf_path(args.pdf, market, pdf_date)
+                    generate_pdf(report_data, pdf_path)
                     print(f"  PDF saved: {pdf_path}\n")
+
+        # -- Consolidated report (multi-market runs) ----------------------------
+        if args.pdf and len(collected_reports) >= 2:
+            consolidated = ConsolidatedReport(
+                reports=collected_reports,
+                edge_threshold=args.edge_threshold,
+                run_date=pdf_date,
+                top_n=args.limit,
+            )
+            display_consolidated(consolidated)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            cons_path = os.path.join(_reports_dir(pdf_date), f"consolidated_{ts}.pdf")
+            generate_consolidated_pdf(consolidated, cons_path)
+            print(f"  Consolidated PDF saved: {cons_path}\n")
 
     except APIConnectionError as e:
         print(f"\nConnection error: {e.message}", file=sys.stderr)
