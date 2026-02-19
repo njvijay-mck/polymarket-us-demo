@@ -135,6 +135,28 @@ def _market_end_date_est(market: dict) -> dt_date | None:
         return None
 
 
+def _market_end_et_str(market: dict) -> str | None:
+    """Return the market settlement time as a full 'YYYY-MM-DD HH:MM ET' string.
+
+    Showing the time (not just the date) makes it clear when the market
+    *settles* vs when a game actually *plays*.  Sports markets often have an
+    endDate set to the following afternoon so Polymarket can process results,
+    which means a game played on day N may show an ET date of day N+1 if only
+    the date portion is displayed.
+    """
+    raw = market.get("endDate") or market.get("endTime")
+    if not raw:
+        return None
+    try:
+        clean = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_EST).strftime("%Y-%m-%d %H:%M ET")
+    except (ValueError, AttributeError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Odds conversions
 # ---------------------------------------------------------------------------
@@ -430,13 +452,13 @@ def search_by_date(
         )
         sys.exit(1)
 
-    print(f"\n  Found {len(candidates)} market(s) resolving on {date_str} (EST):\n")
+    print(f"\n  Found {len(candidates)} market(s) resolving on {date_str} (ET):\n")
     for i, m in enumerate(candidates):
         marker  = " ◄" if i == pick else ""
-        q       = m.get("question", "Untitled")[:68]
+        q       = m.get("question", "Untitled")[:60]
         cat     = m.get("category", "-")
-        end_est = _market_end_date_est(m)
-        print(f"  [{i}] {q}  [{cat}]  {end_est}{marker}")
+        et_str  = _market_end_et_str(m) or str(_market_end_date_est(m))
+        print(f"  [{i}] {q}  [{cat}]  settles {et_str}{marker}")
     print()
 
     if pick is not None:
@@ -526,11 +548,15 @@ def display_odds(market: dict, rows: list[dict], verbose: bool) -> None:
     end_date = _fmt_date(market.get("endDate"))
     desc     = market.get("description", "")
 
-    # Show resolution date in both UTC and EST
-    end_est_date = _market_end_date_est(market)
+    # Show resolution time in both UTC and full ET (date + time).
+    # Sports markets often have an endDate set to the next afternoon so
+    # Polymarket can process results — showing only the ET date would make a
+    # Feb 18 evening game appear to resolve on Feb 19.  The full ET time
+    # makes the settlement window explicit.
     resolves_str = f"{end_date} UTC"
-    if end_est_date:
-        resolves_str += f"  ({end_est_date} EST)"
+    et_str = _market_end_et_str(market)
+    if et_str:
+        resolves_str += f"  ({et_str})"
 
     print(f"\n{'=' * 72}")
     print(f"  {question}")
@@ -700,8 +726,8 @@ def _build_market_payload(market: dict, rows: list[dict]) -> dict:
         "description": market.get("description", ""),
         "category":    market.get("category", "-"),
         "status":      _status_label(market),
-        "resolves":    _fmt_date(market.get("endDate")),
-        "resolves_est": str(_market_end_date_est(market) or "-"),
+        "resolves_utc": _fmt_date(market.get("endDate")),
+        "resolves_et":  _market_end_et_str(market) or "-",
         "outcomes": [
             {
                 "outcome":       r["outcome"],
@@ -1413,7 +1439,6 @@ def generate_pdf(report: ReportData, output_path: str) -> None:
     category = market.get("category", "-")
     status   = _status_label(market)
     end_date = _fmt_date(market.get("endDate"))
-    end_est  = _market_end_date_est(market)
     desc     = market.get("description", "")
     gen_ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1437,9 +1462,13 @@ def generate_pdf(report: ReportData, output_path: str) -> None:
     story.append(Spacer(1, 0.4 * cm))
 
     # ── SECTION 2: Market info card ───────────────────────────────────────────
+    # Show the full ET datetime so settlement time is unambiguous.  Sports
+    # markets commonly have an endDate set to the following afternoon; showing
+    # only the date can make a Feb 18 game look like a Feb 19 event.
     resolves_str = f"{end_date} UTC"
-    if end_est:
-        resolves_str += f"  ({end_est} EST)"
+    et_str = _market_end_et_str(market)
+    if et_str:
+        resolves_str += f"  ({et_str})"
 
     info_rows: list[list] = [
         [Paragraph("MARKET INFORMATION", styles["h1"])],
