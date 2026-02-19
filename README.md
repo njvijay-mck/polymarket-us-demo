@@ -167,7 +167,7 @@ uv run 08_markets_by_date.py --date 2025-06-30 --search "election" --verbose
 
 #### `09_odds_calculator.py` — Odds Calculator & LLM Probability Analysis
 
-Fetches live market prices, converts them into every major odds format, and passes the data to an LLM for analysis. Supports three ways to identify a market (slug, keyword search, or resolution date in EST), multiple LLM providers, an optional 4-stage deep research pipeline powered by Brave Search web results, and a run summary footer listing every agent and source used.
+Fetches live market prices, converts them into every major odds format, and passes the data to an LLM for analysis. Supports three ways to identify a market (slug, keyword search, or resolution date in EST), multiple LLM providers, an optional 4-stage deep research pipeline powered by Brave Search web results, liquidity-based market sorting and filtering, a consolidated multi-market summary, and a run summary footer listing every agent and source used.
 
 ##### Quick start
 
@@ -321,9 +321,56 @@ uv run 09_odds_calculator.py btc-100k-2025 --web-search
 uv run 09_odds_calculator.py btc-100k-2025 --deep-research --verbose
 ```
 
-##### Multi-market analysis
+##### Liquidity sorting & filtering
 
-When using `--search` or `--date` **without** `--pick`, the script shows a numbered list of all matched markets and then runs the full analysis (odds + LLM) on every one of them in sequence. Use `--pick N` to analyse only result N.
+When using `--date` or `--search`, the script fetches volume data for every candidate market in parallel (up to 10 concurrent requests) and then:
+
+1. **Filters** out markets below the minimum notional traded threshold (default **$1 000 USD**).
+2. **Sorts** remaining markets by notional traded (descending) before applying `--limit`.
+3. **Shows** notional traded + open interest everywhere — market listing, odds header, per-market PDF info card, consolidated summary table, and consolidated PDF.
+
+The volume line in the odds header looks like:
+```
+  Volume:    $48.2k vol · 12,430 OI
+```
+
+Use `--min-volume 0` to disable filtering, or raise it to focus on high-liquidity markets only. When analysing a market by slug directly, filtering is skipped (the requested market is always analysed regardless of volume).
+
+```bash
+# Multi-market run — automatically sorted by liquidity
+uv run 09_odds_calculator.py --date 2026-02-25 --search "NBA" --limit 5
+
+# Only show markets with at least $10 000 traded
+uv run 09_odds_calculator.py --date 2026-02-25 --limit 10 --min-volume 10000
+
+# Disable volume filter (include all markets regardless of liquidity)
+uv run 09_odds_calculator.py --search "bitcoin" --limit 20 --min-volume 0
+```
+
+##### Multi-market analysis & consolidated report
+
+When using `--search` or `--date` **without** `--pick`, the script shows a numbered list of all matched markets (sorted by liquidity), then runs the full analysis on every one in sequence. Use `--pick N` to analyse only result N.
+
+After all markets are processed, a **consolidated summary** is printed to the terminal (when 2 or more markets were analysed):
+
+```
+════════════════════════════════════════════════════════════════════════════════════════════════════════
+  CONSOLIDATED SUMMARY — 2026-02-19  (3 markets)
+════════════════════════════════════════════════════════════════════════════════════════════════════════
+  Market                          Best Edge    Best EV    Sentiment  Rec         Volume
+  ────────────────────────────────────────────────────────────────────────────────────────────────────
+  Lakers vs Celtics (...)         YES +8.2%▲   +0.06/c    Bullish    BUY YES     $48.2k vol · 12,430 OI
+  Knicks vs Heat (...)            NO  -3.1%▼   -0.02/c    Neutral    —           $31.0k vol · 8,100 OI
+  BTC 100k (...)                  YES +11.4%▲  +0.09/c    Bullish    BUY YES     $1.2M vol · 420,000 OI
+  ────────────────────────────────────────────────────────────────────────────────────────────────────
+  Top 2 picks by edge  :
+    #1  BTC 100k (...)           edge +11.4%  $1.2M vol · 420,000 OI BUY YES
+    #2  Lakers vs Celtics (...)  edge +8.2%   $48.2k vol · 12,430 OI BUY YES
+  Top 2 picks by EV    :
+    #1  BTC 100k (...)           EV +0.09/c   $1.2M vol · 420,000 OI BUY YES
+    #2  Lakers vs Celtics (...)  EV +0.06/c   $48.2k vol · 12,430 OI BUY YES
+════════════════════════════════════════════════════════════════════════════════════════════════════════
+```
 
 ```bash
 # Show all NBA markets resolving Feb 25 and analyse each one
@@ -335,19 +382,37 @@ uv run 09_odds_calculator.py --date 2026-02-25 --search "NBA" --limit 5 --pick 2
 
 ##### PDF output (`--pdf`)
 
-Saves a polished, colour-coded PDF report to the current directory. The PDF contains every section printed to the terminal — odds table, LLM analysis, edge analysis, EV analysis, social sentiment, sources, and run summary — formatted with headers, bordered tables, and colour highlights.
+Saves polished, colour-coded PDF reports to a **dated subfolder** `reports/YYYY-MM-DD/`. Each per-market PDF contains every section printed to the terminal — odds table, LLM analysis, edge analysis, EV analysis, social sentiment, sources, and run summary — formatted with headers, bordered tables, and colour highlights. Volume (notional traded + open interest) appears in the market info card.
 
-PDFs are excluded from git commits (`.gitignore` entry `*.pdf`) and are intended for local reading.
+When a multi-market run produces 2 or more reports, an additional **consolidated PDF** is generated alongside the individual files. It contains:
+- Title banner with date, market count, and pipeline info
+- Summary table (one row per market): market name, best edge, best EV, sentiment, ROI, recommendation, volume
+- Top picks by edge (ranked, with volume and recommendation)
+- Top picks by EV (ranked, with ROI, volume, and recommendation)
+- Markets to avoid (no edge and no positive EV)
+- Mini odds overview (compact outcome/edge/EV table per market)
+
+**Output folder structure:**
+```
+reports/
+  2026-02-19/
+    lakers-celtics_20260219_143022.pdf      ← individual per-market PDF
+    knicks-heat_20260219_143105.pdf
+    btc-100k-2025_20260219_143148.pdf
+    consolidated_20260219_143200.pdf        ← consolidated PDF (2+ markets only)
+```
+
+The `reports/` folder is git-ignored and intended for local reading only.
 
 ```bash
-# Auto-named <slug>_<YYYYMMDD_HHMMSS>.pdf
+# Auto-named PDF in reports/YYYY-MM-DD/
 uv run 09_odds_calculator.py btc-100k-2025 --pdf
 
-# Specific filename
+# Specific filename (basename placed in the dated subfolder)
 uv run 09_odds_calculator.py btc-100k-2025 --pdf btc_report.pdf
 
-# Deep research → save full report as PDF
-uv run 09_odds_calculator.py btc-100k-2025 --deep-research --pdf
+# Deep research → per-market PDF + consolidated PDF (if 2+ markets)
+uv run 09_odds_calculator.py --date 2026-02-25 --limit 3 --pick 0 --deep-research --pdf
 
 # Odds only (no LLM) → save odds table as PDF
 uv run 09_odds_calculator.py btc-100k-2025 --no-llm --pdf
@@ -397,6 +462,7 @@ Every run (including `--no-llm`) prints a summary at the end:
 | `--date YYYY-MM-DD` | — | Find markets resolving on this date (Eastern Time) |
 | `--pick N` | *(all)* | Which listed result to analyse (0-indexed); omit to analyse all |
 | `--limit N` | `10` | Max markets to show when using `--search` or `--date` |
+| `--min-volume USD` | `1000` | Exclude markets with notional traded below this threshold (0 = no filter) |
 | `--no-llm` | off | Show odds table only, skip all LLM calls |
 | `--llm PROVIDER` | `claude` | LLM provider: `claude`, `openai`, `kimi`, `custom` |
 | `--model MODEL` | *(per-provider default)* | Override the model ID |
@@ -406,9 +472,9 @@ Every run (including `--no-llm`) prints a summary at the end:
 | `--web-search` | off | Run Brave Search to enrich single-pass analysis |
 | `--edge-threshold N` | `5` | Minimum % edge to flag a recommended position |
 | `--verbose` | off | Print raw market JSON |
-| `--pdf [FILENAME]` | — | Save a PDF report (auto-named if no filename given) |
+| `--pdf [FILENAME]` | — | Save PDF report(s) in `reports/YYYY-MM-DD/`; generates a consolidated PDF when 2+ markets are analysed |
 
-> `slug`, `--search`, and `--date` are mutually exclusive. The `--no-llm` flag requires no API key at all. `BRAVE_SEARCH_API_KEY` enables web enrichment for `--web-search` and `--deep-research`; if unset the pipeline continues without web context and prints a warning. PDFs are git-ignored and intended for local reading only.
+> `slug`, `--search`, and `--date` are mutually exclusive. The `--no-llm` flag requires no API key at all. `BRAVE_SEARCH_API_KEY` enables web enrichment for `--web-search` and `--deep-research`; if unset the pipeline continues without web context and prints a warning. PDFs are git-ignored and placed in `reports/YYYY-MM-DD/` for local reading only.
 
 **SDK methods:** `client.markets.retrieve_by_slug()`, `client.search.query()`
 
@@ -585,6 +651,10 @@ polymarket-us-init/
 ├── .python-version           # Python 3.13
 ├── pyproject.toml            # Project config & dependencies
 ├── uv.lock                   # Locked dependency versions
+├── reports/                  # PDF output folder (git-ignored)
+│   └── YYYY-MM-DD/           #   dated subfolder per run
+│       ├── <slug>_<ts>.pdf   #   per-market PDF
+│       └── consolidated_<ts>.pdf  # consolidated PDF (2+ markets)
 ├── 01_browse_markets.py      # Public  — list events & markets
 ├── 02_search_markets.py      # Public  — full-text search
 ├── 03_orderbook_viewer.py    # Public  — order book & BBO
@@ -594,7 +664,8 @@ polymarket-us-init/
 ├── 07_websocket_stream.py    # Auth    — real-time WebSocket streaming
 ├── 08_markets_by_date.py     # Public  — filter markets by resolution date + keyword
 └── 09_odds_calculator.py     # Public  — odds calculator + multi-provider LLM analysis
-                              #           with optional 4-stage deep research pipeline
+                              #           with liquidity sorting, consolidated report,
+                              #           and optional 4-stage deep research pipeline
 ```
 
 ## Dependencies
