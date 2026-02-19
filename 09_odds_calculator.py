@@ -36,6 +36,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date as dt_date, datetime, timezone
 from typing import Any
@@ -441,6 +442,88 @@ def social_media_context(question: str, metrics: RunMetrics, max_results: int = 
 
 
 # ---------------------------------------------------------------------------
+# Market volume / liquidity helpers
+# ---------------------------------------------------------------------------
+
+def _fetch_market_volume(client: PolymarketUS, slug: str) -> dict:
+    """Fetch liquidity metrics for one market via markets.book().
+
+    Returns {"notional_usd": float, "open_interest": float}.
+    Returns zeros on any API error so the caller can rank the market last.
+    """
+    try:
+        book   = client.markets.book(slug)
+        stats  = book.get("marketData", {}).get("stats", {})
+        notional_raw  = stats.get("notionalTraded", {})
+        oi_raw        = stats.get("openInterest",   "0")
+        notional_usd  = float(notional_raw.get("value", 0) if isinstance(notional_raw, dict) else notional_raw)
+        open_interest = float(oi_raw if not isinstance(oi_raw, dict) else oi_raw.get("value", 0))
+        return {"notional_usd": notional_usd, "open_interest": open_interest}
+    except Exception:
+        return {"notional_usd": 0.0, "open_interest": 0.0}
+
+
+def _enrich_markets_with_volume(
+    client:          PolymarketUS,
+    markets:         list[dict],
+    min_volume_usd:  float = 1000.0,
+) -> list[dict]:
+    """Attach volume metrics to each market, filter below threshold, sort by liquidity.
+
+    Fetches volume concurrently (up to 10 parallel requests).
+    Attaches ``_notional_usd`` and ``_open_interest`` onto each market dict.
+    Drops markets where ``_notional_usd < min_volume_usd``.
+    Sorts by ``_notional_usd`` desc, then ``_open_interest`` desc.
+    """
+    if not markets:
+        return markets
+
+    print(f"  Fetching volume for {len(markets)} market(s) ...", end="", flush=True)
+
+    slugs = [m.get("slug", "") for m in markets]
+    slug_to_vol: dict[str, dict] = {}
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_slug = {
+            executor.submit(_fetch_market_volume, client, slug): slug
+            for slug in slugs
+            if slug
+        }
+        for future in as_completed(future_to_slug):
+            slug = future_to_slug[future]
+            slug_to_vol[slug] = future.result()
+
+    for m in markets:
+        vol = slug_to_vol.get(m.get("slug", ""), {"notional_usd": 0.0, "open_interest": 0.0})
+        m["_notional_usd"]  = vol["notional_usd"]
+        m["_open_interest"] = vol["open_interest"]
+
+    before = len(markets)
+    if min_volume_usd > 0:
+        markets = [m for m in markets if m["_notional_usd"] >= min_volume_usd]
+    after = len(markets)
+
+    markets.sort(key=lambda m: (m["_notional_usd"], m["_open_interest"]), reverse=True)
+
+    excluded = before - after
+    suffix = f"  ({excluded} below ${min_volume_usd:,.0f} threshold excluded)" if excluded else ""
+    print(f" done.{suffix}")
+    return markets
+
+
+def _fmt_volume(notional_usd: float, open_interest: float) -> str:
+    """Return a compact human-readable volume string, e.g. '$12.3k vol · 5,412 OI'."""
+    if notional_usd >= 1_000_000:
+        vol_str = f"${notional_usd / 1_000_000:.1f}M"
+    elif notional_usd >= 1_000:
+        vol_str = f"${notional_usd / 1_000:.1f}k"
+    else:
+        vol_str = f"${notional_usd:.0f}"
+    oi_str = f"{open_interest:,.0f}"
+    return f"{vol_str} vol · {oi_str} OI"
+
+
+# ---------------------------------------------------------------------------
 # Market fetching
 # ---------------------------------------------------------------------------
 
@@ -456,13 +539,17 @@ def fetch_market_by_slug(client: PolymarketUS, slug: str) -> dict:
 
 
 def search_and_pick(
-    client: PolymarketUS, query: str, pick: int | None, limit: int
+    client: PolymarketUS,
+    query: str,
+    pick: int | None,
+    limit: int,
+    min_volume_usd: float = 1000.0,
 ) -> list[dict]:
-    """Search for markets, show a numbered list, and return them.
+    """Search for markets, sort by liquidity, show a numbered list, and return them.
 
     If *pick* is given, returns only that one market; otherwise returns all.
     """
-    fetch_n = max(limit * 2, 20)
+    fetch_n = max(limit * 5, 50)
     resp = client.search.query({"query": query, "limit": fetch_n})
     markets: list[dict] = []
     if isinstance(resp, dict):
@@ -472,18 +559,27 @@ def search_and_pick(
     elif isinstance(resp, list):
         markets = resp
 
-    markets = markets[:limit]
-
     if not markets:
         print(f"\n  No markets found for '{query}'.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"\n  Found {len(markets)} market(s) for '{query}':\n")
+    markets = _enrich_markets_with_volume(client, markets, min_volume_usd)
+    markets = markets[:limit]
+
+    if not markets:
+        print(
+            f"\n  No markets found for '{query}' above ${min_volume_usd:,.0f} volume threshold.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"\n  Found {len(markets)} market(s) for '{query}' (sorted by volume):\n")
     for i, m in enumerate(markets):
-        marker = " ◄" if i == pick else ""
-        q   = m.get("question", "Untitled")[:68]
-        cat = m.get("category", "-")
-        print(f"  [{i}] {q}  [{cat}]{marker}")
+        marker  = " ◄" if i == pick else ""
+        q       = m.get("question", "Untitled")[:55]
+        cat     = m.get("category", "-")
+        vol_str = _fmt_volume(m.get("_notional_usd", 0.0), m.get("_open_interest", 0.0))
+        print(f"  [{i}] {q}  [{cat}]  {vol_str}{marker}")
     print()
 
     if pick is not None:
@@ -503,11 +599,12 @@ def search_by_date(
     date_str: str,
     pick: int | None,
     limit: int,
+    min_volume_usd: float = 1000.0,
 ) -> list[dict]:
     """Find markets resolving on *date_str* (YYYY-MM-DD, Eastern Time).
 
-    Paginates through the markets list until *limit* matches are found or the
-    API is exhausted, then displays a numbered menu and returns them.
+    Collects ALL matching markets first, then enriches with volume data,
+    filters below min_volume_usd, sorts by liquidity, and truncates to limit.
     If *pick* is given, returns only that one market; otherwise returns all.
     """
     try:
@@ -516,32 +613,27 @@ def search_by_date(
         print(f"\n  Invalid date '{date_str}'. Use YYYY-MM-DD.", file=sys.stderr)
         sys.exit(1)
 
-    # Display what "today in EST" is so the user can sanity-check
     now_est = datetime.now(_EST)
     print(
         f"\n  Searching for markets resolving on {date_str} (EST)  "
         f"[current EST: {now_est.strftime('%Y-%m-%d %H:%M %Z')}] ..."
     )
 
+    # Collect ALL matching markets (no early exit at limit)
     candidates: list[dict] = []
     page_size = 100
     offset    = 0
     max_pages = 20
 
     for _ in range(max_pages):
-        if len(candidates) >= limit:
-            break
         resp = client.markets.list({"limit": page_size, "offset": offset, "closed": False})
         raw  = resp.get("markets", resp) if isinstance(resp, dict) else resp
         page = raw if isinstance(raw, list) else []
         if not page:
             break
         for m in page:
-            end = _market_end_date_est(m)
-            if end == target_est:
+            if _market_end_date_est(m) == target_est:
                 candidates.append(m)
-                if len(candidates) >= limit:
-                    break
         offset += page_size
         if len(page) < page_size:
             break  # API exhausted
@@ -554,19 +646,32 @@ def search_by_date(
         )
         sys.exit(1)
 
-    print(f"\n  Found {len(candidates)} market(s) with settlement date {date_str} (ET):\n")
+    print(f"\n  Found {len(candidates)} total match(es) on {date_str} — filtering by volume ...")
+    candidates = _enrich_markets_with_volume(client, candidates, min_volume_usd)
+    candidates = candidates[:limit]
+
+    if not candidates:
+        print(
+            f"\n  No markets on {date_str} above ${min_volume_usd:,.0f} volume threshold.\n"
+            "  Try --min-volume 0 to include all, or a different date.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"\n  Top {len(candidates)} market(s) by volume on {date_str} (ET):\n")
     for i, m in enumerate(candidates):
-        marker        = " ◄" if i == pick else ""
-        q             = m.get("question", "Untitled")[:55]
-        cat           = m.get("category", "-")
-        et_str        = _market_end_et_str(m) or str(_market_end_date_est(m))
+        marker         = " ◄" if i == pick else ""
+        q              = m.get("question", "Untitled")[:48]
+        cat            = m.get("category", "-")
+        et_str         = _market_end_et_str(m) or str(_market_end_date_est(m))
         slug_game_date = _game_date_from_slug(m.get("slug", ""))
-        end_est_date  = _market_end_date_est(m)
+        end_est_date   = _market_end_date_est(m)
         if slug_game_date and (end_est_date is None or slug_game_date != end_est_date):
             date_info = f"event {slug_game_date} · settles {et_str}"
         else:
             date_info = f"settles {et_str}"
-        print(f"  [{i}] {q}  [{cat}]  {date_info}{marker}")
+        vol_str = _fmt_volume(m.get("_notional_usd", 0.0), m.get("_open_interest", 0.0))
+        print(f"  [{i}] {q}  [{cat}]  {vol_str}  {date_info}{marker}")
     print()
 
     if pick is not None:
@@ -678,6 +783,10 @@ def display_odds(market: dict, rows: list[dict], verbose: bool) -> None:
     if has_event_date:
         print(f"  Event:     {slug_game_date}  (game date from slug)")
     print(f"  Settles:   {settles_str}  (market settlement deadline)")
+    notional = market.get("_notional_usd")
+    if notional is not None:
+        oi = market.get("_open_interest", 0.0)
+        print(f"  Volume:    {_fmt_volume(notional, oi)}")
     if desc:
         print(f"  Desc:      {desc[:120]}{'...' if len(desc) > 120 else ''}")
     print()
@@ -1456,6 +1565,8 @@ def _compute_market_summary(report: ReportData) -> dict:
         "sentiment_score":   sent_score,
         "recommendation":    recommendation,
         "ev_recommendation": ev_recommendation,
+        "notional_usd":      market.get("_notional_usd", 0.0),
+        "open_interest":     market.get("_open_interest", 0.0),
     }
 
 
@@ -1544,8 +1655,8 @@ def display_consolidated(consolidated: ConsolidatedReport) -> None:
     if not summaries:
         return
 
-    W = 72
-    C_Q, C_E, C_EV, C_S, C_R = 32, 13, 11, 10, 12
+    W = 100
+    C_Q, C_E, C_EV, C_S, C_R, C_V = 32, 13, 11, 10, 12, 20
 
     print(f"\n{'═' * W}")
     header = f"  CONSOLIDATED SUMMARY — {run_date}  ({n} market{'s' if n != 1 else ''})"
@@ -1558,6 +1669,7 @@ def display_consolidated(consolidated: ConsolidatedReport) -> None:
         f"{'Best EV':<{C_EV}}"
         f"{'Sentiment':<{C_S}}"
         f"{'Rec':<{C_R}}"
+        f"{'Volume':<{C_V}}"
     )
     print(col_hdr)
     print(f"  {'─' * (W - 4)}")
@@ -1573,6 +1685,7 @@ def display_consolidated(consolidated: ConsolidatedReport) -> None:
         sent_str = (s["sentiment"] or "—").capitalize()
         rec_str  = s["recommendation"]
         q_str    = s["question"][:C_Q]
+        vol_str  = _fmt_volume(s["notional_usd"], s["open_interest"])
 
         print(
             f"  {q_str:<{C_Q}}"
@@ -1580,6 +1693,7 @@ def display_consolidated(consolidated: ConsolidatedReport) -> None:
             f"{ev_str:<{C_EV}}"
             f"{sent_str:<{C_S}}"
             f"{rec_str:<{C_R}}"
+            f"{vol_str:<{C_V}}"
         )
 
     print(f"  {'─' * (W - 4)}")
@@ -1595,9 +1709,11 @@ def display_consolidated(consolidated: ConsolidatedReport) -> None:
     if by_edge:
         print(f"  Top {len(by_edge)} picks by edge  :")
         for rank, s in enumerate(by_edge, 1):
+            vol_s = _fmt_volume(s["notional_usd"], s["open_interest"])
             print(
-                f"    #{rank:<2} {s['question'][:32]:<33}"
+                f"    #{rank:<2} {s['question'][:28]:<29}"
                 f"edge {s['best_edge']:+.1f}%  "
+                f"{vol_s:<22}"
                 f"{s['recommendation']}"
             )
 
@@ -1610,9 +1726,11 @@ def display_consolidated(consolidated: ConsolidatedReport) -> None:
     if by_ev:
         print(f"  Top {len(by_ev)} picks by EV    :")
         for rank, s in enumerate(by_ev, 1):
+            vol_s = _fmt_volume(s["notional_usd"], s["open_interest"])
             print(
-                f"    #{rank:<2} {s['question'][:32]:<33}"
+                f"    #{rank:<2} {s['question'][:28]:<29}"
                 f"EV {s['best_ev']:+.2f}/c  "
+                f"{vol_s:<22}"
                 f"{s['ev_recommendation']}"
             )
 
@@ -1827,6 +1945,10 @@ def generate_pdf(report: ReportData, output_path: str) -> None:
     if pdf_has_event_date:
         detail_data.append(info_cell("Event date", f"{pdf_slug_game_date}  (game date from slug)"))
     detail_data.append(info_cell("Settles", settles_str + "  (market settlement deadline)"))
+    pdf_notional = market.get("_notional_usd")
+    if pdf_notional is not None:
+        pdf_oi = market.get("_open_interest", 0.0)
+        detail_data.append(info_cell("Liquidity", _fmt_volume(pdf_notional, pdf_oi)))
     if desc:
         short_desc = (desc[:180] + "…") if len(desc) > 180 else desc
         detail_data.append(info_cell("Description", short_desc))
@@ -2399,7 +2521,7 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
     ]))
     story.append(sum_header)
 
-    col_w = [W * f for f in [0.32, 0.15, 0.13, 0.16, 0.13, 0.11]]
+    col_w = [W * f for f in [0.28, 0.13, 0.10, 0.13, 0.09, 0.10, 0.17]]
     sum_data: list[list] = [[
         Paragraph("<b>Market</b>",         styles["small"]),
         Paragraph("<b>Best Edge</b>",      styles["small"]),
@@ -2407,6 +2529,7 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
         Paragraph("<b>Sentiment</b>",      styles["small"]),
         Paragraph("<b>ROI</b>",            styles["small"]),
         Paragraph("<b>Rec</b>",            styles["small"]),
+        Paragraph("<b>Volume</b>",         styles["small"]),
     ]]
     for s in summaries:
         edge_val   = s["best_edge"]
@@ -2419,14 +2542,16 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
         ev_str  = f"{ev_val:+.2f}/c" if s["best_ev_label"] != "—" else "—"
         roi_str = f"{s['roi']:+.1f}%" if s["best_ev_label"] != "—" else "—"
         sent_str = (s["sentiment"] or "—").capitalize()
+        vol_str  = _fmt_volume(s["notional_usd"], s["open_interest"])
 
         sum_data.append([
-            Paragraph(s["question"], styles["body"]),
-            Paragraph(edge_str,      styles["body"]),
-            Paragraph(ev_str,        styles["body"]),
-            Paragraph(sent_str,      styles["body"]),
-            Paragraph(roi_str,       styles["body"]),
-            Paragraph(s["recommendation"], styles["body"]),
+            Paragraph(s["question"],           styles["body"]),
+            Paragraph(edge_str,                styles["body"]),
+            Paragraph(ev_str,                  styles["body"]),
+            Paragraph(sent_str,                styles["body"]),
+            Paragraph(roi_str,                 styles["body"]),
+            Paragraph(s["recommendation"],     styles["body"]),
+            Paragraph(vol_str,                 styles["small"]),
         ])
 
     sum_table = Table(sum_data, colWidths=col_w)
@@ -2474,21 +2599,23 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
         ]))
         story.append(picks_header)
         picks_data = [[
-            Paragraph("<b>Rank</b>",  styles["small"]),
+            Paragraph("<b>Rank</b>",   styles["small"]),
             Paragraph("<b>Market</b>", styles["small"]),
-            Paragraph("<b>Edge</b>",  styles["small"]),
-            Paragraph("<b>Rec</b>",   styles["small"]),
+            Paragraph("<b>Edge</b>",   styles["small"]),
+            Paragraph("<b>Volume</b>", styles["small"]),
+            Paragraph("<b>Rec</b>",    styles["small"]),
         ]]
         for i, s in enumerate(by_edge, 1):
             edge_val  = s["best_edge"]
             edge_str  = f"{s['best_edge_label']} {edge_val:+.1f}%"
             picks_data.append([
-                Paragraph(f"#{i}", styles["body"]),
-                Paragraph(s["question"], styles["body"]),
-                Paragraph(edge_str, styles["body"]),
-                Paragraph(s["recommendation"], styles["body"]),
+                Paragraph(f"#{i}",                 styles["body"]),
+                Paragraph(s["question"],            styles["body"]),
+                Paragraph(edge_str,                 styles["body"]),
+                Paragraph(_fmt_volume(s["notional_usd"], s["open_interest"]), styles["small"]),
+                Paragraph(s["recommendation"],      styles["body"]),
             ])
-        pe_table = Table(picks_data, colWidths=[W * f for f in [0.07, 0.52, 0.22, 0.19]])
+        pe_table = Table(picks_data, colWidths=[W * f for f in [0.07, 0.42, 0.18, 0.18, 0.15]])
         pe_cmds = header_row_style(0, C_NAVY) + grid_style() + [
             ("FONTNAME",   (0, 1), (-1, -1), "Helvetica"),
             ("FONTSIZE",   (0, 1), (-1, -1), 8.5),
@@ -2529,6 +2656,7 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
             Paragraph("<b>EV/c</b>",   styles["small"]),
             Paragraph("<b>ROI</b>",    styles["small"]),
             Paragraph("<b>Rec</b>",    styles["small"]),
+            Paragraph("<b>Volume</b>", styles["small"]),
         ]]
         for i, s in enumerate(by_ev, 1):
             ev_picks_data.append([
@@ -2537,8 +2665,9 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
                 Paragraph(f"{s['best_ev']:+.3f}",    styles["body"]),
                 Paragraph(f"{s['roi']:+.1f}%",       styles["body"]),
                 Paragraph(s["ev_recommendation"],    styles["body"]),
+                Paragraph(_fmt_volume(s["notional_usd"], s["open_interest"]), styles["small"]),
             ])
-        pev_table = Table(ev_picks_data, colWidths=[W * f for f in [0.07, 0.50, 0.13, 0.13, 0.17]])
+        pev_table = Table(ev_picks_data, colWidths=[W * f for f in [0.07, 0.38, 0.11, 0.11, 0.17, 0.16]])
         pev_cmds = header_row_style(0, C_NAVY) + grid_style() + [
             ("FONTNAME",   (0, 1), (-1, -1), "Helvetica"),
             ("FONTSIZE",   (0, 1), (-1, -1), 8.5),
@@ -2838,6 +2967,17 @@ Examples:
             "filename given). PDFs are git-ignored and intended for local reading."
         ),
     )
+    parser.add_argument(
+        "--min-volume",
+        type=float,
+        default=1000.0,
+        metavar="USD",
+        help=(
+            "Minimum USD notional traded to include a market (default: 1000). "
+            "Markets below this threshold are excluded and remaining markets are "
+            "sorted by volume descending."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -2848,10 +2988,18 @@ Examples:
         if args.slug:
             print(f"Fetching market: {args.slug} ...")
             markets = [fetch_market_by_slug(pm_client, args.slug)]
+            # Attach volume for display (no filtering/sorting for single slug)
+            markets = _enrich_markets_with_volume(pm_client, markets, min_volume_usd=0.0)
         elif args.search:
-            markets = search_and_pick(pm_client, args.search, args.pick, args.limit)
+            markets = search_and_pick(
+                pm_client, args.search, args.pick, args.limit,
+                min_volume_usd=args.min_volume,
+            )
         else:
-            markets = search_by_date(pm_client, args.date, args.pick, args.limit)
+            markets = search_by_date(
+                pm_client, args.date, args.pick, args.limit,
+                min_volume_usd=args.min_volume,
+            )
 
         # Create LLM client once (reused across all markets)
         llm_client = None
