@@ -231,26 +231,30 @@ When `BRAVE_SEARCH_API_KEY` is set, the script queries the [Brave Search API](ht
 
 ##### Deep research pipeline (`--deep-research`)
 
-Enables a web-search step followed by 4 LLM stages, each feeding into the next:
+Enables two web-search steps followed by 4 LLM stages, each feeding into the next:
 
 | Step | Role | Output |
 |------|------|--------|
-| 0 — Web Search | Brave Search for live team/event stats and recent news | Web context block |
-| 1 — Research | Investigates using web results + training knowledge; initial probability estimate | Research report |
+| 0a — Web Search | Brave Search for live team/event stats and recent news | Web context block |
+| 0b — Social Search | Brave Search for X/Twitter and Reddit sentiment signals | Social context block |
+| 1 — Research | Investigates using web + social context + training knowledge; initial probability estimate | Research report |
 | 2 — Critique | Stress-tests the research: gaps, biases, counter-arguments, alternative scenarios | Critique report |
 | 3 — Rebuttal | Responds to critiques, concedes where valid, defends where not, revised estimate | Rebuttal report |
-| 4 — Consolidation | Synthesises all findings into a final probability estimate (JSON) + recommendation | Final report + edge analysis |
+| 4 — Consolidation | Synthesises all findings into final probability + sentiment JSON + recommendation | Final report + edge + EV + sentiment |
 
 Progress is printed as each step runs:
 ```
   [0/4] Web Search ...
+  [0/4] Social Search ...
   [1/4] Running Research Agent ...
   [2/4] Running Critique Agent ...
   [3/4] Running Rebuttal Agent ...
   [4/4] Running Consolidation Agent ...
 ```
 
-After Stage 4, the script automatically compares the LLM's probability estimate against Polymarket's implied probability and displays an edge analysis table:
+After Stage 4, the script automatically runs four post-analysis displays:
+
+**Edge analysis** — compares the LLM's probability estimate against Polymarket's implied probability:
 
 ```
 ╔═════════════════════════════════════════════════════════════╗
@@ -266,6 +270,36 @@ After Stage 4, the script automatically compares the LLM's probability estimate 
 ```
 
 If no outcome exceeds the edge threshold: `No edge detected above threshold (5.0%).`
+
+**Expected value analysis** — computes EV and ROI per $1 contract based on LLM probability estimates:
+
+```
+╔══════════════════════════════════════════════════════════════════╗
+║  EXPECTED VALUE  (per $1 contract)                               ║
+╠══════════════════════╦════════════╦════════════╦════════════════╣
+║ Outcome              ║ Buy at     ║ LLM Prob   ║ EV / ROI       ║
+╠══════════════════════╬════════════╬════════════╬════════════════╣
+║ Yes                  ║  $0.3500   ║   55.00%   ║ +0.20  +57.1% ▲║
+║ No                   ║  $0.6500   ║   45.00%   ║ -0.20  -30.8% ▼║
+╚══════════════════════╩════════════╩════════════╩════════════════╝
+
+  Best EV: BUY YES at $0.35  →  +0.20 per contract  (+57.1% ROI)
+```
+
+**Social sentiment analysis** — extracted from the Consolidation agent's structured JSON output:
+
+```
+╔══════════════════════════════════════════════════╗
+║  SOCIAL SENTIMENT  (X / web signals)             ║
+╠══════════════════╦══════════════╦════════════════╣
+║ Overall tone     ║ Bullish      ║ ▲▲  Bullish    ║
+║ Score            ║ 0.68         ║                ║
+║ Discussion vol   ║ High         ║                ║
+╚══════════════════╩══════════════╩════════════════╝
+
+  Signals : "strong X buzz"  |  "Reddit community bullish"
+  Summary : Community broadly expects a Yes resolution based on recent news.
+```
 
 ```bash
 # Deep research with Kimi (Brave Search enrichment automatic)
@@ -287,6 +321,40 @@ uv run 09_odds_calculator.py btc-100k-2025 --web-search
 uv run 09_odds_calculator.py btc-100k-2025 --deep-research --verbose
 ```
 
+##### Multi-market analysis
+
+When using `--search` or `--date` **without** `--pick`, the script shows a numbered list of all matched markets and then runs the full analysis (odds + LLM) on every one of them in sequence. Use `--pick N` to analyse only result N.
+
+```bash
+# Show all NBA markets resolving Feb 25 and analyse each one
+uv run 09_odds_calculator.py --date 2026-02-25 --search "NBA" --limit 5
+
+# Show the list but analyse only result #2
+uv run 09_odds_calculator.py --date 2026-02-25 --search "NBA" --limit 5 --pick 2
+```
+
+##### PDF output (`--pdf`)
+
+Saves a polished, colour-coded PDF report to the current directory. The PDF contains every section printed to the terminal — odds table, LLM analysis, edge analysis, EV analysis, social sentiment, sources, and run summary — formatted with headers, bordered tables, and colour highlights.
+
+PDFs are excluded from git commits (`.gitignore` entry `*.pdf`) and are intended for local reading.
+
+```bash
+# Auto-named <slug>_<YYYYMMDD_HHMMSS>.pdf
+uv run 09_odds_calculator.py btc-100k-2025 --pdf
+
+# Specific filename
+uv run 09_odds_calculator.py btc-100k-2025 --pdf btc_report.pdf
+
+# Deep research → save full report as PDF
+uv run 09_odds_calculator.py btc-100k-2025 --deep-research --pdf
+
+# Odds only (no LLM) → save odds table as PDF
+uv run 09_odds_calculator.py btc-100k-2025 --no-llm --pdf
+```
+
+> Requires the `reportlab` package (already listed in `pyproject.toml`). Run `uv sync` if not yet installed.
+
 ##### Run summary footer
 
 Every run (including `--no-llm`) prints a summary at the end:
@@ -297,7 +365,7 @@ Every run (including `--no-llm`) prints a summary at the end:
 ========================================================================
   Provider  : kimi  (kimi-for-coding)
   Pipeline  : deep-research
-  Agents    : Web Search → Research → Critique → Rebuttal → Consolidation
+  Agents    : Web Search → Social Search → Research → Critique → Rebuttal → Consolidation
   Duration  : 38.4 s
 
   SOURCES REFERENCED  (6 from web search)
@@ -327,19 +395,20 @@ Every run (including `--no-llm`) prints a summary at the end:
 | `slug` | — | Market slug to analyse (e.g. `btc-100k-2025`) |
 | `--search QUERY` | — | Find a market by keyword |
 | `--date YYYY-MM-DD` | — | Find markets resolving on this date (Eastern Time) |
-| `--pick N` | `0` | Which listed result to analyse (0-indexed) |
+| `--pick N` | *(all)* | Which listed result to analyse (0-indexed); omit to analyse all |
 | `--limit N` | `10` | Max markets to show when using `--search` or `--date` |
 | `--no-llm` | off | Show odds table only, skip all LLM calls |
 | `--llm PROVIDER` | `claude` | LLM provider: `claude`, `openai`, `kimi`, `custom` |
 | `--model MODEL` | *(per-provider default)* | Override the model ID |
 | `--llm-base-url URL` | — | Base URL for a custom OpenAI-compatible endpoint |
 | `--llm-api-key KEY` | — | Inline API key override (otherwise read from env) |
-| `--deep-research` | off | Enable web search + 4-stage pipeline + edge analysis |
+| `--deep-research` | off | Enable web + social search + 4-stage pipeline + edge + EV + sentiment |
 | `--web-search` | off | Run Brave Search to enrich single-pass analysis |
 | `--edge-threshold N` | `5` | Minimum % edge to flag a recommended position |
 | `--verbose` | off | Print raw market JSON |
+| `--pdf [FILENAME]` | — | Save a PDF report (auto-named if no filename given) |
 
-> `slug`, `--search`, and `--date` are mutually exclusive. The `--no-llm` flag requires no API key at all. `BRAVE_SEARCH_API_KEY` enables web enrichment for `--web-search` and `--deep-research`; if unset the pipeline continues without web context and prints a warning.
+> `slug`, `--search`, and `--date` are mutually exclusive. The `--no-llm` flag requires no API key at all. `BRAVE_SEARCH_API_KEY` enables web enrichment for `--web-search` and `--deep-research`; if unset the pipeline continues without web context and prints a warning. PDFs are git-ignored and intended for local reading only.
 
 **SDK methods:** `client.markets.retrieve_by_slug()`, `client.search.query()`
 
@@ -537,6 +606,7 @@ polymarket-us-init/
 | `openai` | OpenAI / custom-endpoint client (script 09, `--llm openai/custom`) |
 | `httpx` | HTTP client for Brave Search API calls (script 09 web search) |
 | `python-dotenv` | Load `.env` credentials automatically |
+| `reportlab` | PDF generation for `--pdf` output (script 09) |
 
 ## Links
 

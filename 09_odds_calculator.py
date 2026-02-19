@@ -23,6 +23,8 @@ Usage:
     uv run 09_odds_calculator.py btc-100k-2025 --llm kimi
     uv run 09_odds_calculator.py btc-100k-2025 --deep-research
     uv run 09_odds_calculator.py btc-100k-2025 --deep-research --edge-threshold 3
+    uv run 09_odds_calculator.py btc-100k-2025 --pdf
+    uv run 09_odds_calculator.py btc-100k-2025 --deep-research --pdf report.pdf
     uv run 09_odds_calculator.py --search "bitcoin" --pick 0 --limit 5
     uv run 09_odds_calculator.py --date 2026-02-25 --limit 10 --pick 0
     uv run 09_odds_calculator.py --date 2026-02-25 --llm kimi --deep-research
@@ -65,6 +67,19 @@ class RunMetrics:
 
     def elapsed_s(self) -> float:
         return time.monotonic() - self.start_time
+
+
+@dataclass
+class ReportData:
+    """Accumulates all output data for a single market; used by generate_pdf()."""
+    market: dict
+    rows: list[dict]
+    analysis_text: str = ""          # single-pass analysis or deep research final report
+    llm_probs: list[dict] = field(default_factory=list)
+    sentiment: dict | None = None
+    metrics: RunMetrics | None = None
+    is_deep_research: bool = False
+    edge_threshold: float = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +133,49 @@ def _market_end_date_est(market: dict) -> dt_date | None:
         return dt.astimezone(_EST).date()
     except (ValueError, AttributeError):
         return None
+
+
+def _market_end_et_str(market: dict) -> str | None:
+    """Return the market settlement time as a full 'YYYY-MM-DD HH:MM ET' string.
+
+    Showing the time (not just the date) makes it clear when the market
+    *settles* vs when a game actually *plays*.  Sports markets often have an
+    endDate set to the following afternoon so Polymarket can process results,
+    which means a game played on day N may show an ET date of day N+1 if only
+    the date portion is displayed.
+    """
+    raw = market.get("endDate") or market.get("endTime")
+    if not raw:
+        return None
+    try:
+        clean = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_EST).strftime("%Y-%m-%d %H:%M ET")
+    except (ValueError, AttributeError):
+        return None
+
+
+def _game_date_from_slug(slug: str) -> dt_date | None:
+    """Extract the game/event date from the end of a sports market slug.
+
+    Polymarket sports slugs typically end with YYYY-MM-DD, e.g.:
+      'aec-cbb-stjohn-marq-2026-02-18' → 2026-02-18
+
+    This is the *game* date, which often differs from the settlement
+    endDate (Polymarket sets the settlement deadline to the following
+    day to allow time for official results).
+
+    Returns None for slugs without a trailing date (e.g. 'btc-100k-2025').
+    """
+    m = re.search(r'(\d{4}-\d{2}-\d{2})$', slug)
+    if m:
+        try:
+            return dt_date.fromisoformat(m.group(1))
+        except ValueError:
+            return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -415,13 +473,19 @@ def search_by_date(
         )
         sys.exit(1)
 
-    print(f"\n  Found {len(candidates)} market(s) resolving on {date_str} (EST):\n")
+    print(f"\n  Found {len(candidates)} market(s) with settlement date {date_str} (ET):\n")
     for i, m in enumerate(candidates):
-        marker  = " ◄" if i == pick else ""
-        q       = m.get("question", "Untitled")[:68]
-        cat     = m.get("category", "-")
-        end_est = _market_end_date_est(m)
-        print(f"  [{i}] {q}  [{cat}]  {end_est}{marker}")
+        marker        = " ◄" if i == pick else ""
+        q             = m.get("question", "Untitled")[:55]
+        cat           = m.get("category", "-")
+        et_str        = _market_end_et_str(m) or str(_market_end_date_est(m))
+        slug_game_date = _game_date_from_slug(m.get("slug", ""))
+        end_est_date  = _market_end_date_est(m)
+        if slug_game_date and (end_est_date is None or slug_game_date != end_est_date):
+            date_info = f"event {slug_game_date} · settles {et_str}"
+        else:
+            date_info = f"settles {et_str}"
+        print(f"  [{i}] {q}  [{cat}]  {date_info}{marker}")
     print()
 
     if pick is not None:
@@ -511,18 +575,28 @@ def display_odds(market: dict, rows: list[dict], verbose: bool) -> None:
     end_date = _fmt_date(market.get("endDate"))
     desc     = market.get("description", "")
 
-    # Show resolution date in both UTC and EST
-    end_est_date = _market_end_date_est(market)
-    resolves_str = f"{end_date} UTC"
-    if end_est_date:
-        resolves_str += f"  ({end_est_date} EST)"
+    # Settlement deadline from the API (endDate).
+    # For sports markets Polymarket sets this to the FOLLOWING DAY so there is
+    # time to process official results.  The actual game/event date is embedded
+    # in the slug and shown separately when the two dates differ.
+    et_str        = _market_end_et_str(market)
+    settles_str   = f"{end_date} UTC"
+    if et_str:
+        settles_str += f"  ({et_str})"
+
+    # Game/event date from slug (e.g. 'aec-cbb-stjohn-marq-2026-02-18' → 2026-02-18)
+    slug_game_date    = _game_date_from_slug(slug)
+    end_est_date      = _market_end_date_est(market)
+    has_event_date    = slug_game_date and (end_est_date is None or slug_game_date != end_est_date)
 
     print(f"\n{'=' * 72}")
     print(f"  {question}")
     print(f"{'=' * 72}")
     print(f"  Slug:      {slug}")
     print(f"  Status:    {status}  |  Category: {category}")
-    print(f"  Resolves:  {resolves_str}")
+    if has_event_date:
+        print(f"  Event:     {slug_game_date}  (game date from slug)")
+    print(f"  Settles:   {settles_str}  (market settlement deadline)")
     if desc:
         print(f"  Desc:      {desc[:120]}{'...' if len(desc) > 120 else ''}")
     print()
@@ -680,13 +754,23 @@ def create_llm_client(
 # ---------------------------------------------------------------------------
 
 def _build_market_payload(market: dict, rows: list[dict]) -> dict:
-    return {
+    slug           = market.get("slug", "")
+    slug_game_date = _game_date_from_slug(slug)
+    end_est_date   = _market_end_date_est(market)
+    # Only include event_date when it differs from the settlement date so the
+    # LLM understands the distinction between game day and settlement deadline.
+    event_date_val = (
+        str(slug_game_date)
+        if slug_game_date and (end_est_date is None or slug_game_date != end_est_date)
+        else None
+    )
+    payload: dict = {
         "question":    market.get("question", "Untitled"),
         "description": market.get("description", ""),
         "category":    market.get("category", "-"),
         "status":      _status_label(market),
-        "resolves":    _fmt_date(market.get("endDate")),
-        "resolves_est": str(_market_end_date_est(market) or "-"),
+        "settles_utc": _fmt_date(market.get("endDate")),
+        "settles_et":  _market_end_et_str(market) or "-",
         "outcomes": [
             {
                 "outcome":       r["outcome"],
@@ -700,6 +784,9 @@ def _build_market_payload(market: dict, rows: list[dict]) -> dict:
         ],
         "book_overround": f"{overround([r['implied_prob'] for r in rows]):+.2f}%",
     }
+    if event_date_val:
+        payload["event_date"] = event_date_val
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -1242,6 +1329,659 @@ def display_run_metrics(metrics: RunMetrics) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PDF report generation
+# ---------------------------------------------------------------------------
+
+def _resolve_pdf_path(arg: str, market: dict) -> str:
+    """Return the PDF output path: user-supplied name, or auto-generated."""
+    if arg and arg != "auto":
+        return arg
+    slug = market.get("slug", "market")
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{slug}_{ts}.pdf"
+
+
+def _md_to_paragraphs(text: str, styles: Any) -> list:
+    """Convert simple LLM markdown output into a list of reportlab Flowables."""
+    from reportlab.platypus import Paragraph, Spacer
+    from reportlab.lib.units import cm
+
+    body   = styles["body"]
+    h2     = styles["h2"]
+    bullet = styles["bullet"]
+
+    flowables: list = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            flowables.append(Spacer(1, 0.15 * cm))
+            continue
+        if stripped.startswith("## "):
+            flowables.append(Spacer(1, 0.2 * cm))
+            flowables.append(Paragraph(stripped[3:], h2))
+            flowables.append(Spacer(1, 0.1 * cm))
+        elif stripped.startswith("### "):
+            flowables.append(Spacer(1, 0.15 * cm))
+            flowables.append(Paragraph(f"<b>{stripped[4:]}</b>", body))
+        elif stripped.startswith("- ") or stripped.startswith("* "):
+            content = stripped[2:]
+            content = content.replace("**", "<b>", 1).replace("**", "</b>", 1)
+            flowables.append(Paragraph(f"• {content}", bullet))
+        else:
+            content = stripped
+            # Convert inline **bold** markers
+            import re as _re
+            content = _re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", content)
+            flowables.append(Paragraph(content, body))
+    return flowables
+
+
+def generate_pdf(report: ReportData, output_path: str) -> None:
+    """Render a polished PDF report for one market using reportlab Platypus."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Table, TableStyle,
+            Spacer, HRFlowable, KeepTogether,
+        )
+    except ImportError:
+        print(
+            "\n  [PDF] reportlab is not installed.\n"
+            "  Run: uv sync   (it is listed in pyproject.toml)",
+            file=sys.stderr,
+        )
+        return
+
+    # ── Color palette ────────────────────────────────────────────────────────
+    C_NAVY   = colors.HexColor("#1a3a5c")   # dark navy — main headers
+    C_BLUE   = colors.HexColor("#2e6da4")   # medium blue — sub-headers
+    C_GOLD   = colors.HexColor("#c8922a")   # gold — highlights / accents
+    C_ALT    = colors.HexColor("#eef3f8")   # light blue — alternating rows
+    C_LGRAY  = colors.HexColor("#d8e2ec")   # light gray — borders
+    C_GREEN  = colors.HexColor("#1e7e34")   # green — positive edge
+    C_RED    = colors.HexColor("#c0392b")   # red — negative edge
+    C_TEXT   = colors.HexColor("#1a1a2e")   # near-black body text
+    C_WHITE  = colors.white
+
+    # ── Paragraph styles ─────────────────────────────────────────────────────
+    base   = getSampleStyleSheet()
+    normal = base["Normal"]
+
+    def ps(name: str, **kw) -> ParagraphStyle:
+        return ParagraphStyle(name, parent=normal, **kw)
+
+    styles = {
+        "title":    ps("title",   fontSize=18, textColor=C_WHITE,  fontName="Helvetica-Bold",
+                        spaceAfter=2, leading=22),
+        "subtitle": ps("subtitle", fontSize=9,  textColor=C_LGRAY,  fontName="Helvetica",
+                        spaceAfter=0),
+        "h1":       ps("h1",      fontSize=12, textColor=C_WHITE,  fontName="Helvetica-Bold",
+                        spaceBefore=4, spaceAfter=4, leading=16),
+        "h2":       ps("h2",      fontSize=10, textColor=C_NAVY,   fontName="Helvetica-Bold",
+                        spaceBefore=6, spaceAfter=3),
+        "body":     ps("body",    fontSize=9,  textColor=C_TEXT,   fontName="Helvetica",
+                        leading=13, spaceAfter=2),
+        "bullet":   ps("bullet",  fontSize=9,  textColor=C_TEXT,   fontName="Helvetica",
+                        leading=13, leftIndent=12, spaceAfter=1),
+        "small":    ps("small",   fontSize=7.5, textColor=colors.HexColor("#555577"),
+                        fontName="Helvetica"),
+        "bold":     ps("bold",    fontSize=9,  textColor=C_TEXT,   fontName="Helvetica-Bold"),
+        "recommend":ps("recommend", fontSize=10, textColor=C_NAVY, fontName="Helvetica-Bold",
+                        spaceBefore=4, spaceAfter=4),
+    }
+
+    # ── Common table helpers ──────────────────────────────────────────────────
+    def header_row_style(row: int, bg: Any = C_NAVY) -> list:
+        return [
+            ("BACKGROUND", (0, row), (-1, row), bg),
+            ("TEXTCOLOR",  (0, row), (-1, row), C_WHITE),
+            ("FONTNAME",   (0, row), (-1, row), "Helvetica-Bold"),
+            ("FONTSIZE",   (0, row), (-1, row), 8.5),
+            ("TOPPADDING", (0, row), (-1, row), 5),
+            ("BOTTOMPADDING", (0, row), (-1, row), 5),
+        ]
+
+    def body_row_style(start: int, count: int) -> list:
+        cmds = [
+            ("FONTNAME",   (0, start), (-1, start + count - 1), "Helvetica"),
+            ("FONTSIZE",   (0, start), (-1, start + count - 1), 8.5),
+            ("TOPPADDING", (0, start), (-1, start + count - 1), 4),
+            ("BOTTOMPADDING", (0, start), (-1, start + count - 1), 4),
+        ]
+        for r in range(count):
+            if r % 2 == 1:
+                cmds.append(("BACKGROUND", (0, start + r), (-1, start + r), C_ALT))
+        return cmds
+
+    def grid_style() -> list:
+        return [
+            ("GRID",       (0, 0), (-1, -1), 0.4, C_LGRAY),
+            ("ROWBACKGROUNDS", (0, 0), (-1, -1), [C_WHITE, C_ALT]),
+        ]
+
+    # ── Document setup ────────────────────────────────────────────────────────
+    doc = SimpleDocTemplate(
+        output_path,
+        pagesize=A4,
+        leftMargin=1.8 * cm,
+        rightMargin=1.8 * cm,
+        topMargin=1.5 * cm,
+        bottomMargin=1.8 * cm,
+        title="Polymarket Odds Analysis",
+        author="09_odds_calculator.py",
+    )
+    W = doc.width  # usable width
+    story: list = []
+
+    market   = report.market
+    rows     = report.rows
+    metrics  = report.metrics
+    question = market.get("question", "Untitled")
+    slug     = market.get("slug", "-")
+    category = market.get("category", "-")
+    status   = _status_label(market)
+    end_date = _fmt_date(market.get("endDate"))
+    desc     = market.get("description", "")
+    gen_ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── SECTION 1: Title banner ───────────────────────────────────────────────
+    banner_data = [
+        [Paragraph("POLYMARKET ODDS ANALYSIS REPORT", styles["title"])],
+        [Paragraph(f"Generated {gen_ts}  ·  {slug}", styles["subtitle"])],
+    ]
+    banner_table = Table(banner_data, colWidths=[W])
+    banner_table.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, -1), C_NAVY),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 12),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 12),
+        ("TOPPADDING",    (0, 0), (0, 0),  10),
+        ("BOTTOMPADDING", (0, 0), (0, 0),  2),
+        ("TOPPADDING",    (0, 1), (0, 1),  2),
+        ("BOTTOMPADDING", (0, 1), (0, 1),  10),
+        ("LINEBELOW",     (0, -1), (-1, -1), 3, C_GOLD),
+    ]))
+    story.append(banner_table)
+    story.append(Spacer(1, 0.4 * cm))
+
+    # ── SECTION 2: Market info card ───────────────────────────────────────────
+    # Show the full ET datetime for the settlement deadline.
+    # For sports markets the settlement is set to the FOLLOWING DAY; also show
+    # the actual game date extracted from the slug when the two differ.
+    pdf_et_str    = _market_end_et_str(market)
+    settles_str   = f"{end_date} UTC"
+    if pdf_et_str:
+        settles_str += f"  ({pdf_et_str})"
+
+    pdf_slug_game_date = _game_date_from_slug(slug)
+    pdf_end_est_date   = _market_end_date_est(market)
+    pdf_has_event_date = (
+        pdf_slug_game_date and
+        (pdf_end_est_date is None or pdf_slug_game_date != pdf_end_est_date)
+    )
+
+    info_rows: list[list] = [
+        [Paragraph("MARKET INFORMATION", styles["h1"])],
+    ]
+    info_header = Table(info_rows, colWidths=[W])
+    info_header.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, -1), C_BLUE),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+        ("TOPPADDING",   (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+    ]))
+    story.append(info_header)
+
+    def info_cell(label: str, value: str) -> list:
+        return [
+            Paragraph(f"<b>{label}</b>", styles["small"]),
+            Paragraph(value or "—", styles["body"]),
+        ]
+
+    detail_data = [
+        info_cell("Question",  question),
+        info_cell("Slug",      slug),
+        info_cell("Category",  f"{category}  ·  Status: {status}"),
+    ]
+    if pdf_has_event_date:
+        detail_data.append(info_cell("Event date", f"{pdf_slug_game_date}  (game date from slug)"))
+    detail_data.append(info_cell("Settles", settles_str + "  (market settlement deadline)"))
+    if desc:
+        short_desc = (desc[:180] + "…") if len(desc) > 180 else desc
+        detail_data.append(info_cell("Description", short_desc))
+
+    detail_table = Table(detail_data, colWidths=[2.5 * cm, W - 2.5 * cm])
+    detail_table.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, -1), colors.HexColor("#f5f8fc")),
+        ("FONTNAME",     (0, 0), (-1, -1), "Helvetica"),
+        ("FONTSIZE",     (0, 0), (-1, -1), 9),
+        ("TOPPADDING",   (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 4),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("LINEBELOW",    (0, 0), (-1, -1), 0.3, C_LGRAY),
+        ("LINEAFTER",    (0, 0), (0, -1),  0.3, C_LGRAY),
+        ("LINEBELOW",    (0, -1), (-1, -1), 1.5, C_BLUE),
+    ]))
+    story.append(detail_table)
+    story.append(Spacer(1, 0.5 * cm))
+
+    # ── SECTION 3: Odds table ─────────────────────────────────────────────────
+    prices   = [r["implied_prob"] for r in rows]
+    vig      = overround(prices) if len(prices) > 1 else 0.0
+    vig_note = f"Book overround (vig): {vig:+.2f}%  " \
+               f"({'favours bookmaker' if vig > 0 else 'favours bettor' if vig < 0 else 'zero vig'})"
+
+    odds_header = Table([[Paragraph("ODDS TABLE", styles["h1"])]], colWidths=[W])
+    odds_header.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, -1), C_BLUE),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+        ("TOPPADDING",   (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+    ]))
+    story.append(odds_header)
+
+    col_w = [W * f for f in [0.24, 0.13, 0.14, 0.13, 0.17, 0.19]]
+    odds_data: list[list] = [
+        [Paragraph(h, styles["bold"]) for h in
+         ["Outcome", "Price", "Implied %", "Decimal", "American", "Fractional"]],
+    ]
+    for r in rows:
+        odds_data.append([
+            Paragraph(r["outcome"], styles["body"]),
+            Paragraph(f"${r['price']:.4f}", styles["body"]),
+            Paragraph(f"{r['prob_pct']:.2f}%", styles["body"]),
+            Paragraph(f"{r['decimal']:.4f}", styles["body"]),
+            Paragraph(r["american"], styles["body"]),
+            Paragraph(r["fractional"], styles["body"]),
+        ])
+    odds_table = Table(odds_data, colWidths=col_w, repeatRows=1)
+    odds_table.setStyle(TableStyle(
+        header_row_style(0) + body_row_style(1, len(rows)) + grid_style() + [
+            ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+            ("ALIGN", (0, 0), (0,  -1), "LEFT"),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("LEFTPADDING",  (0, 0), (-1, -1), 6),
+        ]
+    ))
+    story.append(odds_table)
+    story.append(Spacer(1, 0.15 * cm))
+    story.append(Paragraph(vig_note, styles["small"]))
+    story.append(Spacer(1, 0.5 * cm))
+
+    # ── SECTION 4: LLM Analysis ───────────────────────────────────────────────
+    if report.analysis_text and metrics:
+        section_title = "DEEP RESEARCH ANALYSIS" if report.is_deep_research else "LLM ANALYSIS"
+        provider_info = f"{metrics.provider}  ·  {metrics.model}" if metrics.model else metrics.provider
+        analysis_header = Table(
+            [[Paragraph(f"{section_title}  [{provider_info}]", styles["h1"])]],
+            colWidths=[W],
+        )
+        analysis_header.setStyle(TableStyle([
+            ("BACKGROUND",   (0, 0), (-1, -1), C_BLUE),
+            ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+            ("TOPPADDING",   (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+        ]))
+        story.append(analysis_header)
+        story.append(Spacer(1, 0.2 * cm))
+        story.extend(_md_to_paragraphs(report.analysis_text, styles))
+        story.append(Spacer(1, 0.4 * cm))
+
+    # ── SECTION 5: Edge Analysis ──────────────────────────────────────────────
+    if report.is_deep_research and report.llm_probs:
+        llm_map: dict[str, float] = {
+            item["outcome"].lower(): float(item["llm_probability"])
+            for item in report.llm_probs
+        }
+        matched: list[tuple[str, float, float]] = []
+        for row in rows:
+            key   = row["outcome"].lower()
+            llm_p = llm_map.get(key)
+            if llm_p is None:
+                for k, v in llm_map.items():
+                    if k in key or key in k:
+                        llm_p = v
+                        break
+            if llm_p is not None:
+                matched.append((row["outcome"], row["implied_prob"], llm_p))
+
+        if matched:
+            thr = report.edge_threshold
+            edge_header = Table(
+                [[Paragraph(f"EDGE ANALYSIS  (threshold: {thr:.1f}%)", styles["h1"])]],
+                colWidths=[W],
+            )
+            edge_header.setStyle(TableStyle([
+                ("BACKGROUND",   (0, 0), (-1, -1), C_NAVY),
+                ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+                ("TOPPADDING",   (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+            ]))
+            story.append(edge_header)
+
+            ecol_w = [W * f for f in [0.34, 0.22, 0.22, 0.22]]
+            edge_data: list[list] = [
+                [Paragraph(h, styles["bold"]) for h in
+                 ["Outcome", "Market %", "LLM Est %", "Edge"]],
+            ]
+            best_label, best_edge = "", 0.0
+            for label, market_p, llm_p in matched:
+                edge     = (llm_p - market_p) * 100
+                arrow    = "▲" if edge > 0 else "▼"
+                edge_str = f"{edge:+.1f}% {arrow}"
+                edge_data.append([
+                    Paragraph(label, styles["body"]),
+                    Paragraph(f"{market_p * 100:.2f}%", styles["body"]),
+                    Paragraph(f"{llm_p * 100:.2f}%", styles["body"]),
+                    Paragraph(edge_str, styles["body"]),
+                ])
+                if abs(edge) > abs(best_edge):
+                    best_label, best_edge = label, edge
+
+            edge_table = Table(edge_data, colWidths=ecol_w)
+            edge_cmds = header_row_style(0, C_NAVY) + grid_style() + [
+                ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+                ("ALIGN", (0, 0), (0,  -1), "LEFT"),
+                ("FONTNAME",   (0, 1), (-1, -1), "Helvetica"),
+                ("FONTSIZE",   (0, 1), (-1, -1), 8.5),
+                ("TOPPADDING", (0, 1), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("LEFTPADDING",  (0, 0), (-1, -1), 6),
+            ]
+            # Colour positive/negative edge cells
+            for i, (_, market_p, llm_p) in enumerate(matched):
+                edge = (llm_p - market_p) * 100
+                clr  = C_GREEN if edge > 0 else C_RED
+                edge_cmds.append(("TEXTCOLOR", (3, i + 1), (3, i + 1), clr))
+                edge_cmds.append(("FONTNAME",  (3, i + 1), (3, i + 1), "Helvetica-Bold"))
+            edge_table.setStyle(TableStyle(edge_cmds))
+            story.append(edge_table)
+            story.append(Spacer(1, 0.15 * cm))
+
+            if abs(best_edge) >= thr:
+                direction = "BUY" if best_edge > 0 else "SELL"
+                rec_text  = (
+                    f"★  RECOMMENDED POSITION: {direction} {best_label.upper()}"
+                    f"  (edge {best_edge:+.1f}%)"
+                )
+                rec_box = Table([[Paragraph(rec_text, styles["recommend"])]], colWidths=[W])
+                rec_box.setStyle(TableStyle([
+                    ("BACKGROUND",   (0, 0), (-1, -1), colors.HexColor("#fef9ee")),
+                    ("LEFTPADDING",  (0, 0), (-1, -1), 12),
+                    ("TOPPADDING",   (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+                    ("LINEBELOW",    (0, -1), (-1, -1), 2, C_GOLD),
+                    ("LINEBEFORE",   (0, 0), (0, -1),  4, C_GOLD),
+                ]))
+                story.append(rec_box)
+            else:
+                story.append(Paragraph(
+                    f"No edge detected above threshold ({thr:.1f}%).",
+                    styles["small"],
+                ))
+            story.append(Spacer(1, 0.5 * cm))
+
+    # ── SECTION 6: EV Analysis ────────────────────────────────────────────────
+    if report.is_deep_research and report.llm_probs:
+        llm_map = {
+            item["outcome"].lower(): float(item["llm_probability"])
+            for item in report.llm_probs
+        }
+        ev_matched: list[tuple[str, float, float]] = []
+        for row in rows:
+            label = row.get("outcome", "")
+            price = row.get("price", 0.0)
+            key   = label.lower()
+            llm_p = llm_map.get(key)
+            if llm_p is None:
+                for lk, lv in llm_map.items():
+                    if lk in key or key in lk:
+                        llm_p = lv
+                        break
+            if llm_p is not None:
+                ev_matched.append((label, price, llm_p))
+
+        if ev_matched:
+            ev_header = Table(
+                [[Paragraph("EXPECTED VALUE  (per $1 contract)", styles["h1"])]],
+                colWidths=[W],
+            )
+            ev_header.setStyle(TableStyle([
+                ("BACKGROUND",   (0, 0), (-1, -1), C_NAVY),
+                ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+                ("TOPPADDING",   (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+            ]))
+            story.append(ev_header)
+
+            evcol_w = [W * f for f in [0.30, 0.20, 0.20, 0.30]]
+            ev_data: list[list] = [
+                [Paragraph(h, styles["bold"]) for h in
+                 ["Outcome", "Buy at", "LLM Prob", "EV / ROI"]],
+            ]
+            best_ev_label, best_ev = "", 0.0
+            best_ev_price = 0.0
+            for label, price, llm_p in ev_matched:
+                ev  = llm_p - price
+                roi = (ev / price * 100) if price > 0 else 0.0
+                arrow    = "▲" if ev > 0 else "▼"
+                ev_str   = f"{ev:+.3f}  {roi:+.1f}% {arrow}"
+                ev_data.append([
+                    Paragraph(label, styles["body"]),
+                    Paragraph(f"${price:.4f}", styles["body"]),
+                    Paragraph(f"{llm_p * 100:.2f}%", styles["body"]),
+                    Paragraph(ev_str, styles["body"]),
+                ])
+                if ev > best_ev:
+                    best_ev_label, best_ev, best_ev_price = label, ev, price
+
+            ev_table = Table(ev_data, colWidths=evcol_w)
+            ev_cmds = header_row_style(0, C_NAVY) + grid_style() + [
+                ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+                ("ALIGN", (0, 0), (0,  -1), "LEFT"),
+                ("FONTNAME",   (0, 1), (-1, -1), "Helvetica"),
+                ("FONTSIZE",   (0, 1), (-1, -1), 8.5),
+                ("TOPPADDING", (0, 1), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("LEFTPADDING",  (0, 0), (-1, -1), 6),
+            ]
+            for i, (_, price, llm_p) in enumerate(ev_matched):
+                ev  = llm_p - price
+                clr = C_GREEN if ev > 0 else C_RED
+                ev_cmds.append(("TEXTCOLOR", (3, i + 1), (3, i + 1), clr))
+                ev_cmds.append(("FONTNAME",  (3, i + 1), (3, i + 1), "Helvetica-Bold"))
+            ev_table.setStyle(TableStyle(ev_cmds))
+            story.append(ev_table)
+
+            if best_ev > 0:
+                roi = (best_ev / best_ev_price * 100) if best_ev_price > 0 else 0.0
+                story.append(Spacer(1, 0.1 * cm))
+                story.append(Paragraph(
+                    f"Best EV: BUY {best_ev_label.upper()} at ${best_ev_price:.4f}"
+                    f"  →  {best_ev:+.3f} per contract  ({roi:+.1f}% ROI)",
+                    styles["small"],
+                ))
+            story.append(Spacer(1, 0.5 * cm))
+
+    # ── SECTION 7: Social Sentiment ───────────────────────────────────────────
+    if report.sentiment:
+        sent = report.sentiment
+        overall  = sent.get("overall", "neutral").capitalize()
+        score    = float(sent.get("score", 0.5))
+        volume   = sent.get("volume", "moderate").capitalize()
+        signals  = sent.get("signals", [])
+        summary  = sent.get("summary", "").strip()
+
+        if score >= 0.70:
+            indicator = "▲▲▲  Strongly Bullish"
+            ind_color = C_GREEN
+        elif score >= 0.55:
+            indicator = "▲▲   Bullish"
+            ind_color = C_GREEN
+        elif score >= 0.45:
+            indicator = "───  Neutral"
+            ind_color = colors.HexColor("#888888")
+        elif score >= 0.30:
+            indicator = "▼▼   Bearish"
+            ind_color = C_RED
+        else:
+            indicator = "▼▼▼  Strongly Bearish"
+            ind_color = C_RED
+
+        sent_header = Table(
+            [[Paragraph("SOCIAL SENTIMENT  (X / Reddit signals)", styles["h1"])]],
+            colWidths=[W],
+        )
+        sent_header.setStyle(TableStyle([
+            ("BACKGROUND",   (0, 0), (-1, -1), C_BLUE),
+            ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+            ("TOPPADDING",   (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+        ]))
+        story.append(sent_header)
+
+        scol_w = [W * f for f in [0.25, 0.20, 0.55]]
+        sent_data = [
+            [Paragraph("<b>Overall tone</b>", styles["small"]),
+             Paragraph(overall, styles["body"]),
+             Paragraph(indicator, styles["body"])],
+            [Paragraph("<b>Score</b>", styles["small"]),
+             Paragraph(f"{score:.2f} / 1.0", styles["body"]),
+             Paragraph("", styles["body"])],
+            [Paragraph("<b>Discussion</b>", styles["small"]),
+             Paragraph(volume, styles["body"]),
+             Paragraph("", styles["body"])],
+        ]
+        if signals:
+            sigs_str = "  ·  ".join(f'"{s}"' for s in signals)
+            sent_data.append([
+                Paragraph("<b>Signals</b>", styles["small"]),
+                Paragraph(sigs_str, styles["body"]),
+                Paragraph("", styles["body"]),
+            ])
+        if summary:
+            sent_data.append([
+                Paragraph("<b>Summary</b>", styles["small"]),
+                Paragraph(summary, styles["body"]),
+                Paragraph("", styles["body"]),
+            ])
+
+        sent_table = Table(sent_data, colWidths=scol_w)
+        sent_table.setStyle(TableStyle([
+            ("BACKGROUND",   (0, 0), (-1, -1), colors.HexColor("#f5f8fc")),
+            ("FONTSIZE",     (0, 0), (-1, -1), 9),
+            ("TOPPADDING",   (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING",(0, 0), (-1, -1), 4),
+            ("LEFTPADDING",  (0, 0), (-1, -1), 8),
+            ("LINEBELOW",    (0, 0), (-1, -1), 0.3, C_LGRAY),
+            ("LINEAFTER",    (0, 0), (1, -1),  0.3, C_LGRAY),
+            ("TEXTCOLOR",    (2, 0), (2, 0),   ind_color),
+            ("FONTNAME",     (2, 0), (2, 0),   "Helvetica-Bold"),
+            ("LINEBELOW",    (0, -1), (-1, -1), 1.5, C_BLUE),
+        ]))
+        story.append(sent_table)
+        story.append(Spacer(1, 0.5 * cm))
+
+    # ── SECTION 8: Run Summary ────────────────────────────────────────────────
+    if metrics:
+        run_header = Table(
+            [[Paragraph("RUN SUMMARY", styles["h1"])]],
+            colWidths=[W],
+        )
+        run_header.setStyle(TableStyle([
+            ("BACKGROUND",   (0, 0), (-1, -1), C_NAVY),
+            ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+            ("TOPPADDING",   (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+        ]))
+        story.append(run_header)
+
+        elapsed = metrics.elapsed_s()
+        agents  = " → ".join(metrics.agents_run) if metrics.agents_run else "—"
+        run_data = [
+            ["Provider",  f"{metrics.provider}  ({metrics.model})" if metrics.model else metrics.provider],
+            ["Pipeline",  metrics.pipeline],
+            ["Agents",    agents],
+            ["Duration",  f"{elapsed:.1f} s"],
+        ]
+        run_table = Table(
+            [[Paragraph(f"<b>{k}</b>", styles["small"]), Paragraph(v, styles["body"])]
+             for k, v in run_data],
+            colWidths=[2.5 * cm, W - 2.5 * cm],
+        )
+        run_table.setStyle(TableStyle([
+            ("BACKGROUND",   (0, 0), (-1, -1), colors.HexColor("#f5f8fc")),
+            ("FONTSIZE",     (0, 0), (-1, -1), 9),
+            ("TOPPADDING",   (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING",(0, 0), (-1, -1), 4),
+            ("LEFTPADDING",  (0, 0), (-1, -1), 8),
+            ("LINEBELOW",    (0, 0), (-1, -1), 0.3, C_LGRAY),
+            ("LINEAFTER",    (0, 0), (0, -1),  0.3, C_LGRAY),
+        ]))
+        story.append(run_table)
+
+        if metrics.sources:
+            story.append(Spacer(1, 0.3 * cm))
+            story.append(Paragraph(
+                f"<b>Sources referenced  ({len(metrics.sources)} from web search)</b>",
+                styles["bold"],
+            ))
+            story.append(Spacer(1, 0.1 * cm))
+            src_data = []
+            for i, src in enumerate(metrics.sources, 1):
+                title = src.get("title", "")
+                url   = src.get("url", "")
+                label = (title[:70] + "…") if len(title) > 70 else title
+                src_data.append([
+                    Paragraph(f"[{i}]", styles["small"]),
+                    Paragraph(
+                        f"{label}<br/><font color='#2e6da4'><i>{url}</i></font>"
+                        if url else label,
+                        styles["small"],
+                    ),
+                ])
+            src_table = Table(src_data, colWidths=[0.6 * cm, W - 0.6 * cm])
+            src_table.setStyle(TableStyle([
+                ("FONTSIZE",     (0, 0), (-1, -1), 7.5),
+                ("TOPPADDING",   (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING",(0, 0), (-1, -1), 3),
+                ("LEFTPADDING",  (0, 0), (-1, -1), 4),
+                ("LINEBELOW",    (0, 0), (-1, -1), 0.3, C_LGRAY),
+                ("VALIGN",       (0, 0), (-1, -1), "TOP"),
+            ]))
+            story.append(src_table)
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.5 * cm))
+    footer_table = Table(
+        [[Paragraph(
+            "Generated by 09_odds_calculator.py  ·  Polymarket US API demo  ·  "
+            "For informational purposes only",
+            styles["small"],
+        )]],
+        colWidths=[W],
+    )
+    footer_table.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, -1), C_NAVY),
+        ("TEXTCOLOR",    (0, 0), (-1, -1), C_LGRAY),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+        ("TOPPADDING",   (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+        ("LINEABOVE",    (0, 0), (-1, -1), 3, C_GOLD),
+    ]))
+    story.append(footer_table)
+
+    # ── Build ─────────────────────────────────────────────────────────────────
+    doc.build(story)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1355,6 +2095,17 @@ Examples:
         action="store_true",
         help="Print raw market JSON",
     )
+    parser.add_argument(
+        "--pdf",
+        nargs="?",
+        const="auto",
+        default=None,
+        metavar="FILENAME",
+        help=(
+            "Save a formatted PDF report (auto-named <slug>_<timestamp>.pdf if no "
+            "filename given). PDFs are git-ignored and intended for local reading."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1408,6 +2159,13 @@ Examples:
                 metrics.pipeline = "none (--no-llm)"
                 print("  (LLM analysis skipped — run without --no-llm to enable)\n")
                 display_run_metrics(metrics)
+                if args.pdf:
+                    pdf_path = _resolve_pdf_path(args.pdf, market)
+                    generate_pdf(
+                        ReportData(market=market, rows=rows, metrics=metrics),
+                        pdf_path,
+                    )
+                    print(f"  PDF saved: {pdf_path}\n")
                 continue
 
             metrics.provider = args.llm
@@ -1423,6 +2181,23 @@ Examples:
                 display_ev_analysis(rows, llm_probs)
                 sentiment = parse_sentiment(final_report)
                 display_sentiment_analysis(sentiment)
+                display_run_metrics(metrics)
+                if args.pdf:
+                    pdf_path = _resolve_pdf_path(args.pdf, market)
+                    generate_pdf(
+                        ReportData(
+                            market=market,
+                            rows=rows,
+                            analysis_text=final_report,
+                            llm_probs=llm_probs,
+                            sentiment=sentiment,
+                            metrics=metrics,
+                            is_deep_research=True,
+                            edge_threshold=args.edge_threshold,
+                        ),
+                        pdf_path,
+                    )
+                    print(f"  PDF saved: {pdf_path}\n")
             else:
                 metrics.pipeline = "single-pass"
                 web_context = ""
@@ -1439,8 +2214,20 @@ Examples:
                 print(f"  Asking {args.llm} for analysis ...\n")
                 analysis = llm_analysis(market, rows, llm_client, web_context=web_context)
                 display_llm_analysis(analysis, provider=args.llm)
-
-            display_run_metrics(metrics)
+                display_run_metrics(metrics)
+                if args.pdf:
+                    pdf_path = _resolve_pdf_path(args.pdf, market)
+                    generate_pdf(
+                        ReportData(
+                            market=market,
+                            rows=rows,
+                            analysis_text=analysis,
+                            metrics=metrics,
+                            is_deep_research=False,
+                        ),
+                        pdf_path,
+                    )
+                    print(f"  PDF saved: {pdf_path}\n")
 
     except APIConnectionError as e:
         print(f"\nConnection error: {e.message}", file=sys.stderr)
