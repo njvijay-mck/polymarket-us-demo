@@ -96,50 +96,75 @@ class ConsolidatedReport:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _annotate_outcome(label: str, question: str) -> str:
-    """Return label with team/school name appended if label is a mascot.
+def _extract_vs_teams(question: str) -> list[str]:
+    """Extract [team_a, team_b] from a 'Team A vs. Team B' style question.
 
-    Searches for the label (case-insensitive, word-boundary) inside the market
-    question.  If the 1-2 words immediately preceding it in the question are not
-    already part of the label, they are the school/city identifier and are
-    appended in brackets.
-
-    Examples
-    --------
-    "Red Storm"     + "St. John's Red Storm vs Marquette" → "Red Storm (St. John's)"
-    "Golden Eagles" + "... vs Marquette Golden Eagles"    → "Golden Eagles (Marquette)"
-    "Lakers"        + "Los Angeles Lakers vs ..."         → "Lakers (Los Angeles)"
-    "YES"           + "Will X win?"                       → "YES"  (no match → unchanged)
+    Tries common separators in order.  Returns [] when none match.
     """
-    if not question or not label:
-        return label
-    label_lc = label.lower()
-    question_lc = question.lower()
-    idx = question_lc.find(label_lc)
-    if idx == -1:
-        return label
-    # Extract the text before the match, split into words, take last 1-2
-    before = question[:idx].strip()
-    prefix_words = before.split()
-    if not prefix_words:
-        return label
-    # Take up to 2 preceding words, skip common filler words
-    fillers = {"will", "the", "a", "an", "vs", "vs.", "beat", "win", "over", "at",
-               "against", "?", "-", "·", "do", "does", "would"}
-    candidates: list[str] = []
-    for w in reversed(prefix_words):
-        if w.lower().rstrip(".,?") in fillers:
-            break
-        candidates.insert(0, w)
-        if len(candidates) == 2:
-            break
-    if not candidates:
-        return label
-    prefix = " ".join(candidates)
-    # Don't annotate if prefix is already contained in the label
-    if prefix.lower() in label_lc:
-        return label
-    return f"{label} ({prefix})"
+    for sep in (" vs. ", " vs ", " or ", " / "):
+        parts = re.split(re.escape(sep), question, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2:
+            team1 = parts[0].strip()
+            team2 = parts[1].split("?")[0].strip()
+            # Strip common question preamble from team1
+            for prefix in ("Will ", "Who wins: ", "Who will win: ", "Who will win "):
+                if team1.lower().startswith(prefix.lower()):
+                    team1 = team1[len(prefix):].strip()
+                    break
+            return [team1, team2]
+    return []
+
+
+def _build_outcome_display_labels(rows: list[dict], question: str) -> dict[str, str]:
+    """Return {raw_label: display_label} for every outcome in rows.
+
+    Three cases handled in priority order:
+
+    1. Label exactly equals a team name from the question → keep as-is.
+    2. Label is the mascot suffix of a full team name in the question
+       (e.g. "Lakers" inside "Los Angeles Lakers") → annotate with the
+       city/school prefix: "Lakers (Los Angeles)".
+    3. Label has no textual overlap with any team name (pure mascot like
+       "Wildcats") → positional mapping: outcome[i] → team[i] from the
+       question, yielding "Wildcats (New Hampshire)".
+
+    YES/NO binary markets are always returned unchanged.
+    """
+    labels = [row.get("outcome", "") for row in rows]
+    # Binary YES/NO markets need no annotation
+    if all(lbl.upper() in ("YES", "NO") for lbl in labels):
+        return {lbl: lbl for lbl in labels}
+
+    teams = _extract_vs_teams(question)
+    result: dict[str, str] = {}
+
+    for i, label in enumerate(labels):
+        label_lc = label.lower()
+        annotated = label
+
+        if teams:
+            for team in teams:
+                team_lc = team.lower()
+                # Case 1: exact match — no annotation needed
+                if team_lc == label_lc:
+                    annotated = label
+                    break
+                # Case 2: label is a trailing portion of the full team name
+                if team_lc.endswith(label_lc) and len(team_lc) > len(label_lc):
+                    prefix = team[:team_lc.index(label_lc)].strip()
+                    if prefix:
+                        annotated = f"{label} ({prefix})"
+                    break
+            else:
+                # Case 3: label not found in any team name — use position
+                if i < len(teams):
+                    team = teams[i]
+                    if team.lower() != label_lc:
+                        annotated = f"{label} ({team})"
+
+        result[label] = annotated
+
+    return result
 
 
 def _parse_json_str(value: str | list | None) -> list:
@@ -1156,6 +1181,7 @@ def display_edge_analysis(
         if "outcome" in item and "llm_probability" in item
     }
 
+    label_map = _build_outcome_display_labels(rows, question)
     matched: list[tuple[str, float, float]] = []
     for row in rows:
         key   = row["outcome"].lower()
@@ -1166,7 +1192,7 @@ def display_edge_analysis(
                     llm_p = v
                     break
         if llm_p is not None:
-            display_label = _annotate_outcome(row["outcome"], question)
+            display_label = label_map.get(row["outcome"], row["outcome"])
             matched.append((display_label, row["implied_prob"], llm_p))
 
     if not matched:
@@ -1226,12 +1252,13 @@ def display_ev_analysis(rows: list[dict], llm_probs: list[dict], question: str =
         if "outcome" in item and "llm_probability" in item
     }
 
+    label_map = _build_outcome_display_labels(rows, question)
     matched: list[tuple[str, float, float]] = []
     for row in rows:
         label = row.get("outcome", "")
         price = row.get("price", 0.0)
         key   = label.lower()
-        display_label = _annotate_outcome(label, question)
+        display_label = label_map.get(label, label)
         if key in llm_map:
             matched.append((display_label, price, llm_map[key]))
         else:
@@ -1359,6 +1386,7 @@ def _compute_market_summary(report: ReportData) -> dict:
     }
 
     # Match rows to llm_map
+    label_map = _build_outcome_display_labels(rows, question)
     matched_edge: list[tuple[str, float, float]] = []   # (label, market_p, llm_p)
     matched_ev:   list[tuple[str, float, float]] = []   # (label, price, llm_p)
     for row in rows:
@@ -1373,7 +1401,7 @@ def _compute_market_summary(report: ReportData) -> dict:
                     llm_p = v
                     break
         if llm_p is not None:
-            display_label = _annotate_outcome(label, question)
+            display_label = label_map.get(label, label)
             matched_edge.append((display_label, imp, llm_p))
             matched_ev.append((display_label, price, llm_p))
 
@@ -1887,6 +1915,7 @@ def generate_pdf(report: ReportData, output_path: str) -> None:
             item["outcome"].lower(): float(item["llm_probability"])
             for item in report.llm_probs
         }
+        label_map_edge = _build_outcome_display_labels(rows, question)
         matched: list[tuple[str, float, float]] = []
         for row in rows:
             key   = row["outcome"].lower()
@@ -1897,7 +1926,7 @@ def generate_pdf(report: ReportData, output_path: str) -> None:
                         llm_p = v
                         break
             if llm_p is not None:
-                display_label = _annotate_outcome(row["outcome"], question)
+                display_label = label_map_edge.get(row["outcome"], row["outcome"])
                 matched.append((display_label, row["implied_prob"], llm_p))
 
         if matched:
@@ -1983,6 +2012,7 @@ def generate_pdf(report: ReportData, output_path: str) -> None:
             item["outcome"].lower(): float(item["llm_probability"])
             for item in report.llm_probs
         }
+        label_map_ev = _build_outcome_display_labels(rows, question)
         ev_matched: list[tuple[str, float, float]] = []
         for row in rows:
             label = row.get("outcome", "")
@@ -1995,7 +2025,7 @@ def generate_pdf(report: ReportData, output_path: str) -> None:
                         llm_p = lv
                         break
             if llm_p is not None:
-                display_label = _annotate_outcome(label, question)
+                display_label = label_map_ev.get(label, label)
                 ev_matched.append((display_label, price, llm_p))
 
         if ev_matched:
@@ -2611,6 +2641,9 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
             ("LEFTPADDING",   (0, 0), (-1, -1), 5),
             ("VALIGN",        (0, 0), (-1, -1), "TOP"),
         ]
+        mini_label_map = _build_outcome_display_labels(
+            report.rows, report.market.get("question", "")
+        )
         for row_i, row in enumerate(report.rows, 1):
             label  = row.get("outcome", "")
             price  = row.get("price", 0.0)
@@ -2622,6 +2655,7 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
                     if lk in key or key in lk:
                         llm_p = lv
                         break
+            display_label = mini_label_map.get(label, label)
 
             if llm_p is not None:
                 edge = (llm_p - imp) * 100
@@ -2629,7 +2663,7 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
                 roi  = (ev / price * 100) if price > 0 else 0.0
                 edge_arrow = "▲" if edge > 0 else "▼"
                 mini_data.append([
-                    Paragraph(label, styles["small"]),
+                    Paragraph(display_label, styles["small"]),
                     Paragraph(f"{imp * 100:.1f}%",   styles["small"]),
                     Paragraph(f"{llm_p * 100:.1f}%", styles["small"]),
                     Paragraph(f"{edge:+.1f}%{edge_arrow}", styles["small"]),
@@ -2643,7 +2677,7 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
                 mini_cmds.append(("TEXTCOLOR", (4, row_i), (5, row_i), clr_v))
             else:
                 mini_data.append([
-                    Paragraph(label, styles["small"]),
+                    Paragraph(display_label, styles["small"]),
                     Paragraph(f"{imp * 100:.1f}%", styles["small"]),
                     Paragraph("—", styles["small"]),
                     Paragraph("—", styles["small"]),
