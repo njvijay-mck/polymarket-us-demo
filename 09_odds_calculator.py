@@ -619,24 +619,37 @@ def search_by_date(
         f"[current EST: {now_est.strftime('%Y-%m-%d %H:%M %Z')}] ..."
     )
 
-    # Collect ALL matching markets (no early exit at limit)
+    # Collect ALL matching markets (no early exit at limit).
+    # No closed filter: the API sorts markets by endDate ascending across ~5 000
+    # records total.  Near-term markets (including those Polymarket pre-marks as
+    # closed=True while still in settlement staging) live at offsets 4 000-4 800,
+    # well beyond the old max_pages=20 cap (offset 1 900).  We scan without a
+    # closed filter and stop early once every date in a page exceeds target_est.
     candidates: list[dict] = []
     page_size = 100
     offset    = 0
-    max_pages = 20
+    max_pages = 70  # covers ~7 000 records — well past the current ~5 000 total
 
     for _ in range(max_pages):
-        resp = client.markets.list({"limit": page_size, "offset": offset, "closed": False})
+        resp = client.markets.list({"limit": page_size, "offset": offset})
         raw  = resp.get("markets", resp) if isinstance(resp, dict) else resp
         page = raw if isinstance(raw, list) else []
         if not page:
             break
-        for m in page:
-            if _market_end_date_est(m) == target_est:
+        page_dates = [_market_end_date_est(m) for m in page]
+        for m, d in zip(page, page_dates):
+            if d == target_est:
                 candidates.append(m)
         offset += page_size
-        if len(page) < page_size:
-            break  # API exhausted
+        # NOTE: do NOT break on len(page) < page_size — the API occasionally
+        # returns short pages mid-dataset (e.g. 99 records at offset 2400) even
+        # though more records exist at higher offsets.  Only an empty page (caught
+        # above) reliably signals the end of data.
+        # Early-exit: dates are ascending — once every date in this page is
+        # strictly after the target we won't find any more matches ahead.
+        valid_dates = [d for d in page_dates if d is not None]
+        if valid_dates and min(valid_dates) > target_est:
+            break
 
     if not candidates:
         print(
