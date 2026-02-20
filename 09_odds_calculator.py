@@ -640,6 +640,11 @@ def search_by_date(
         for m, d in zip(page, page_dates):
             if d == target_est:
                 candidates.append(m)
+            elif _game_date_from_slug(m.get("slug", "")) == target_est:
+                # Polymarket sometimes sets endDate 14 days out (batch settlement)
+                # even for games on target_est.  The slug always encodes the real
+                # game date, so use it as a fallback match.
+                candidates.append(m)
         offset += page_size
         # NOTE: do NOT break on len(page) < page_size — the API occasionally
         # returns short pages mid-dataset (e.g. 99 records at offset 2400) even
