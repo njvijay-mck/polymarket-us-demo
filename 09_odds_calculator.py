@@ -94,6 +94,26 @@ class ConsolidatedReport:
 
 
 # ---------------------------------------------------------------------------
+# Confidence-reason legend  (shown in consolidated report and PDF)
+# ---------------------------------------------------------------------------
+
+_CONFIDENCE_REASON_LEGEND: dict[str, str] = {
+    "stats":     "Team/player statistics drove the estimate",
+    "injury":    "Player injury status is the key variable",
+    "form":      "Recent form/performance trend is decisive",
+    "news":      "Breaking news materially changes the outlook",
+    "data":      "Market or historical base-rate data used",
+    "record":    "Head-to-head record is the main reference",
+    "volume":    "Trading volume signals informed positioning",
+    "consensus": "Expert or public consensus is the anchor",
+    "weather":   "Weather/field conditions are the swing factor",
+    "schedule":  "Schedule strength or matchup context",
+    "momentum":  "Recent momentum swing is the key signal",
+    "unclear":   "Insufficient information to be confident",
+}
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -1801,6 +1821,17 @@ def display_consolidated(consolidated: ConsolidatedReport) -> None:
                 f"{why_str}"
             )
 
+    # WHY column legend
+    print(f"\n  {'─' * (W - 4)}")
+    print("  WHY COLUMN LEGEND")
+    items = list(_CONFIDENCE_REASON_LEGEND.items())
+    col1, col2 = items[::2], items[1::2]
+    for (k1, v1), (k2, v2) in zip(col1, col2):
+        print(f"    {k1:<12} {v1:<42}  {k2:<12} {v2}")
+    if len(items) % 2:
+        k1, v1 = items[-1]
+        print(f"    {k1:<12} {v1}")
+
     print(f"{'═' * W}\n")
 
 
@@ -2899,6 +2930,45 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
         mini_table.setStyle(TableStyle(mini_cmds))
         story.append(mini_table)
         story.append(Spacer(1, 0.3 * cm))
+
+    # ── SECTION 7: WHY column legend ─────────────────────────────────────────
+    legend_header = Table(
+        [[Paragraph("WHY COLUMN LEGEND  (confidence_reason key)", styles["h1"])]],
+        colWidths=[W],
+    )
+    legend_header.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, -1), C_BLUE),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+        ("TOPPADDING",   (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+    ]))
+    story.append(legend_header)
+
+    items = list(_CONFIDENCE_REASON_LEGEND.items())
+    legend_data: list[list] = []
+    for i in range(0, len(items), 2):
+        row: list = []
+        for k, v in items[i:i + 2]:
+            row.append(Paragraph(f"<b>{k}</b>", styles["bold"]))
+            row.append(Paragraph(v, styles["small"]))
+        # Pad to 4 cells if odd item count
+        while len(row) < 4:
+            row.append(Paragraph("", styles["small"]))
+        legend_data.append(row)
+
+    leg_col_w = [W * f for f in [0.10, 0.40, 0.10, 0.40]]
+    leg_table = Table(legend_data, colWidths=leg_col_w)
+    leg_table.setStyle(TableStyle([
+        ("FONTSIZE",      (0, 0), (-1, -1), 8.5),
+        ("TOPPADDING",    (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+        ("GRID",          (0, 0), (-1, -1), 0.4, C_LGRAY),
+        ("ROWBACKGROUNDS",(0, 0), (-1, -1), [C_WHITE, C_ALT]),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(leg_table)
+    story.append(Spacer(1, 0.4 * cm))
 
     # ── Footer ────────────────────────────────────────────────────────────────
     story.append(Spacer(1, 0.3 * cm))
