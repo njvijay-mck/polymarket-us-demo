@@ -94,6 +94,26 @@ class ConsolidatedReport:
 
 
 # ---------------------------------------------------------------------------
+# Confidence-reason legend  (shown in consolidated report and PDF)
+# ---------------------------------------------------------------------------
+
+_CONFIDENCE_REASON_LEGEND: dict[str, str] = {
+    "stats":     "Team/player statistics drove the estimate",
+    "injury":    "Player injury status is the key variable",
+    "form":      "Recent form/performance trend is decisive",
+    "news":      "Breaking news materially changes the outlook",
+    "data":      "Market or historical base-rate data used",
+    "record":    "Head-to-head record is the main reference",
+    "volume":    "Trading volume signals informed positioning",
+    "consensus": "Expert or public consensus is the anchor",
+    "weather":   "Weather/field conditions are the swing factor",
+    "schedule":  "Schedule strength or matchup context",
+    "momentum":  "Recent momentum swing is the key signal",
+    "unclear":   "Insufficient information to be confident",
+}
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -237,6 +257,27 @@ def _market_end_et_str(market: dict) -> str | None:
         return dt.astimezone(_EST).strftime("%Y-%m-%d %H:%M ET")
     except (ValueError, AttributeError):
         return None
+
+
+def _game_start_et_str(market: dict) -> str:
+    """Return the game start time as 'Mon DD H:MMam/pm ET', e.g. 'Feb 21 7:30PM ET'.
+
+    Reads the gameStartTime field (ISO UTC) and converts to Eastern Time.
+    Returns '—' if the field is absent or unparseable.
+    """
+    raw = market.get("gameStartTime")
+    if not raw:
+        return "—"
+    try:
+        clean = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt_et = dt.astimezone(_EST)
+        hour = dt_et.strftime("%I").lstrip("0") or "12"
+        return dt_et.strftime(f"%b %d {hour}:%M%p ET")  # e.g. "Feb 21 7:30PM ET"
+    except (ValueError, AttributeError):
+        return "—"
 
 
 def _game_date_from_slug(slug: str) -> dt_date | None:
@@ -1022,6 +1063,21 @@ odds in multiple formats, plus any web search context provided. Your job is to:
 
 Be factual, concise, and avoid financial advice disclaimers. Format your
 response with clear headings using markdown (##).
+
+IMPORTANT: You MUST include the following JSON block (one entry per outcome):
+
+```json
+[
+  {"outcome": "Yes", "llm_probability": 0.62, "confidence": "medium", "confidence_reason": "stats"},
+  {"outcome": "No",  "llm_probability": 0.38, "confidence": "medium", "confidence_reason": "stats"}
+]
+```
+
+Replace the outcome names and probabilities with your actual estimates.
+The "outcome" values must exactly match the outcome labels in the market data.
+Probabilities must sum to 1.0.
+- "confidence": "low", "medium", or "high"
+- "confidence_reason": exactly ONE word summarising the main driver (e.g. "stats", "injury", "form", "news", "unclear", "data")
 """
 
 
@@ -1141,14 +1197,15 @@ IMPORTANT: You MUST include the following JSON block (one entry per outcome):
 
 ```json
 [
-  {"outcome": "Yes", "llm_probability": 0.62, "confidence": "medium"},
-  {"outcome": "No",  "llm_probability": 0.38, "confidence": "medium"}
+  {"outcome": "Yes", "llm_probability": 0.62, "confidence": "medium", "confidence_reason": "stats"},
+  {"outcome": "No",  "llm_probability": 0.38, "confidence": "medium", "confidence_reason": "stats"}
 ]
 ```
 
 Replace the outcome names and probabilities with your actual estimates.
 The "outcome" values must exactly match the outcome labels in the market data.
 Probabilities must sum to 1.0.
+- "confidence_reason": exactly ONE word summarising the main driver (e.g. "stats", "injury", "form", "news", "unclear", "data")
 
 IMPORTANT: You MUST also include a sentiment JSON block based on the social
 media and community signals provided:
@@ -1576,6 +1633,17 @@ def _compute_market_summary(report: ReportData) -> dict:
     # EV-based recommendation (independent of edge threshold)
     ev_recommendation = f"BUY {best_ev_label.upper()}" if best_ev > 0 else "—"
 
+    # Confidence and 1-word reason from llm_probs
+    confidence = "—"
+    confidence_reason = "—"
+    if llm_probs:
+        confs = [item.get("confidence", "") for item in llm_probs if item.get("confidence")]
+        if confs:
+            confidence = confs[0].capitalize()
+        reasons = [item.get("confidence_reason", "") for item in llm_probs if item.get("confidence_reason")]
+        if reasons:
+            confidence_reason = reasons[0].split()[0][:12]  # ensure single word, max 12 chars
+
     return {
         "question":          q_short,
         "slug":              slug,
@@ -1591,6 +1659,9 @@ def _compute_market_summary(report: ReportData) -> dict:
         "ev_recommendation": ev_recommendation,
         "notional_usd":      market.get("_notional_usd", 0.0),
         "open_interest":     market.get("_open_interest", 0.0),
+        "confidence":        confidence,
+        "confidence_reason": confidence_reason,
+        "game_start":        _game_start_et_str(market),
     }
 
 
@@ -1679,8 +1750,8 @@ def display_consolidated(consolidated: ConsolidatedReport) -> None:
     if not summaries:
         return
 
-    W = 100
-    C_Q, C_E, C_EV, C_S, C_R, C_V = 32, 13, 11, 10, 12, 20
+    W = 114
+    C_Q, C_E, C_EV, C_S, C_R, C_V, C_C, C_W = 30, 13, 11, 10, 12, 18, 9, 10
 
     print(f"\n{'═' * W}")
     header = f"  CONSOLIDATED SUMMARY — {run_date}  ({n} market{'s' if n != 1 else ''})"
@@ -1693,6 +1764,8 @@ def display_consolidated(consolidated: ConsolidatedReport) -> None:
         f"{'Best EV':<{C_EV}}"
         f"{'Sentiment':<{C_S}}"
         f"{'Rec':<{C_R}}"
+        f"{'Conf':<{C_C}}"
+        f"{'Why':<{C_W}}"
         f"{'Volume':<{C_V}}"
     )
     print(col_hdr)
@@ -1710,6 +1783,8 @@ def display_consolidated(consolidated: ConsolidatedReport) -> None:
         rec_str  = s["recommendation"]
         q_str    = s["question"][:C_Q]
         vol_str  = _fmt_volume(s["notional_usd"], s["open_interest"])
+        conf_str = s.get("confidence", "—")
+        why_str  = s.get("confidence_reason", "—")
 
         print(
             f"  {q_str:<{C_Q}}"
@@ -1717,6 +1792,8 @@ def display_consolidated(consolidated: ConsolidatedReport) -> None:
             f"{ev_str:<{C_EV}}"
             f"{sent_str:<{C_S}}"
             f"{rec_str:<{C_R}}"
+            f"{conf_str:<{C_C}}"
+            f"{why_str:<{C_W}}"
             f"{vol_str:<{C_V}}"
         )
 
@@ -1733,12 +1810,16 @@ def display_consolidated(consolidated: ConsolidatedReport) -> None:
     if by_edge:
         print(f"  Top {len(by_edge)} picks by edge  :")
         for rank, s in enumerate(by_edge, 1):
-            vol_s = _fmt_volume(s["notional_usd"], s["open_interest"])
+            vol_s    = _fmt_volume(s["notional_usd"], s["open_interest"])
+            conf_str = s.get("confidence", "—")
+            why_str  = s.get("confidence_reason", "—")
             print(
-                f"    #{rank:<2} {s['question'][:28]:<29}"
+                f"    #{rank:<2} {s['question'][:26]:<27}"
                 f"edge {s['best_edge']:+.1f}%  "
-                f"{vol_s:<22}"
-                f"{s['recommendation']}"
+                f"{vol_s:<20}"
+                f"{s['recommendation']:<16}"
+                f"{conf_str:<9}"
+                f"{why_str}"
             )
 
     # Top picks by EV
@@ -1750,13 +1831,28 @@ def display_consolidated(consolidated: ConsolidatedReport) -> None:
     if by_ev:
         print(f"  Top {len(by_ev)} picks by EV    :")
         for rank, s in enumerate(by_ev, 1):
-            vol_s = _fmt_volume(s["notional_usd"], s["open_interest"])
+            vol_s    = _fmt_volume(s["notional_usd"], s["open_interest"])
+            conf_str = s.get("confidence", "—")
+            why_str  = s.get("confidence_reason", "—")
             print(
-                f"    #{rank:<2} {s['question'][:28]:<29}"
+                f"    #{rank:<2} {s['question'][:26]:<27}"
                 f"EV {s['best_ev']:+.2f}/c  "
-                f"{vol_s:<22}"
-                f"{s['ev_recommendation']}"
+                f"{vol_s:<20}"
+                f"{s['ev_recommendation']:<16}"
+                f"{conf_str:<9}"
+                f"{why_str}"
             )
+
+    # WHY column legend
+    print(f"\n  {'─' * (W - 4)}")
+    print("  WHY COLUMN LEGEND")
+    items = list(_CONFIDENCE_REASON_LEGEND.items())
+    col1, col2 = items[::2], items[1::2]
+    for (k1, v1), (k2, v2) in zip(col1, col2):
+        print(f"    {k1:<12} {v1:<42}  {k2:<12} {v2}")
+    if len(items) % 2:
+        k1, v1 = items[-1]
+        print(f"    {k1:<12} {v1}")
 
     print(f"{'═' * W}\n")
 
@@ -2545,7 +2641,7 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
     ]))
     story.append(sum_header)
 
-    col_w = [W * f for f in [0.28, 0.13, 0.10, 0.13, 0.09, 0.10, 0.17]]
+    col_w = [W * f for f in [0.23, 0.12, 0.09, 0.10, 0.08, 0.08, 0.09, 0.09, 0.12]]
     sum_data: list[list] = [[
         Paragraph("<b>Market</b>",         styles["small"]),
         Paragraph("<b>Best Edge</b>",      styles["small"]),
@@ -2553,6 +2649,8 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
         Paragraph("<b>Sentiment</b>",      styles["small"]),
         Paragraph("<b>ROI</b>",            styles["small"]),
         Paragraph("<b>Rec</b>",            styles["small"]),
+        Paragraph("<b>Conf</b>",           styles["small"]),
+        Paragraph("<b>Why</b>",            styles["small"]),
         Paragraph("<b>Volume</b>",         styles["small"]),
     ]]
     for s in summaries:
@@ -2567,6 +2665,8 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
         roi_str = f"{s['roi']:+.1f}%" if s["best_ev_label"] != "—" else "—"
         sent_str = (s["sentiment"] or "—").capitalize()
         vol_str  = _fmt_volume(s["notional_usd"], s["open_interest"])
+        conf_str = s.get("confidence", "—")
+        why_str  = s.get("confidence_reason", "—")
 
         sum_data.append([
             Paragraph(s["question"],           styles["body"]),
@@ -2575,6 +2675,8 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
             Paragraph(sent_str,                styles["body"]),
             Paragraph(roi_str,                 styles["body"]),
             Paragraph(s["recommendation"],     styles["body"]),
+            Paragraph(conf_str,                styles["body"]),
+            Paragraph(why_str,                 styles["body"]),
             Paragraph(vol_str,                 styles["small"]),
         ])
 
@@ -2623,23 +2725,29 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
         ]))
         story.append(picks_header)
         picks_data = [[
-            Paragraph("<b>Rank</b>",   styles["small"]),
-            Paragraph("<b>Market</b>", styles["small"]),
-            Paragraph("<b>Edge</b>",   styles["small"]),
-            Paragraph("<b>Volume</b>", styles["small"]),
-            Paragraph("<b>Rec</b>",    styles["small"]),
+            Paragraph("<b>Rank</b>",      styles["small"]),
+            Paragraph("<b>Market</b>",    styles["small"]),
+            Paragraph("<b>Game Time</b>", styles["small"]),
+            Paragraph("<b>Edge</b>",      styles["small"]),
+            Paragraph("<b>Volume</b>",    styles["small"]),
+            Paragraph("<b>Rec</b>",       styles["small"]),
+            Paragraph("<b>Conf</b>",      styles["small"]),
+            Paragraph("<b>Why</b>",       styles["small"]),
         ]]
         for i, s in enumerate(by_edge, 1):
             edge_val  = s["best_edge"]
             edge_str  = f"{s['best_edge_label']} {edge_val:+.1f}%"
             picks_data.append([
-                Paragraph(f"#{i}",                 styles["body"]),
-                Paragraph(s["question"],            styles["body"]),
-                Paragraph(edge_str,                 styles["body"]),
+                Paragraph(f"#{i}",                          styles["body"]),
+                Paragraph(s["question"],                    styles["body"]),
+                Paragraph(s.get("game_start", "—"),         styles["small"]),
+                Paragraph(edge_str,                         styles["body"]),
                 Paragraph(_fmt_volume(s["notional_usd"], s["open_interest"]), styles["small"]),
-                Paragraph(s["recommendation"],      styles["body"]),
+                Paragraph(s["recommendation"],              styles["body"]),
+                Paragraph(s.get("confidence", "—"),         styles["body"]),
+                Paragraph(s.get("confidence_reason", "—"),  styles["body"]),
             ])
-        pe_table = Table(picks_data, colWidths=[W * f for f in [0.07, 0.42, 0.18, 0.18, 0.15]])
+        pe_table = Table(picks_data, colWidths=[W * f for f in [0.06, 0.22, 0.13, 0.15, 0.15, 0.13, 0.08, 0.08]])
         pe_cmds = header_row_style(0, C_NAVY) + grid_style() + [
             ("FONTNAME",   (0, 1), (-1, -1), "Helvetica"),
             ("FONTSIZE",   (0, 1), (-1, -1), 8.5),
@@ -2675,23 +2783,29 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
         ]))
         story.append(ev_picks_header)
         ev_picks_data = [[
-            Paragraph("<b>Rank</b>",   styles["small"]),
-            Paragraph("<b>Market</b>", styles["small"]),
-            Paragraph("<b>EV/c</b>",   styles["small"]),
-            Paragraph("<b>ROI</b>",    styles["small"]),
-            Paragraph("<b>Rec</b>",    styles["small"]),
-            Paragraph("<b>Volume</b>", styles["small"]),
+            Paragraph("<b>Rank</b>",      styles["small"]),
+            Paragraph("<b>Market</b>",    styles["small"]),
+            Paragraph("<b>Game Time</b>", styles["small"]),
+            Paragraph("<b>EV/c</b>",      styles["small"]),
+            Paragraph("<b>ROI</b>",       styles["small"]),
+            Paragraph("<b>Rec</b>",       styles["small"]),
+            Paragraph("<b>Volume</b>",    styles["small"]),
+            Paragraph("<b>Conf</b>",      styles["small"]),
+            Paragraph("<b>Why</b>",       styles["small"]),
         ]]
         for i, s in enumerate(by_ev, 1):
             ev_picks_data.append([
-                Paragraph(f"#{i}",                   styles["body"]),
-                Paragraph(s["question"],             styles["body"]),
-                Paragraph(f"{s['best_ev']:+.3f}",    styles["body"]),
-                Paragraph(f"{s['roi']:+.1f}%",       styles["body"]),
-                Paragraph(s["ev_recommendation"],    styles["body"]),
+                Paragraph(f"#{i}",                          styles["body"]),
+                Paragraph(s["question"],                    styles["body"]),
+                Paragraph(s.get("game_start", "—"),         styles["small"]),
+                Paragraph(f"{s['best_ev']:+.3f}",           styles["body"]),
+                Paragraph(f"{s['roi']:+.1f}%",              styles["body"]),
+                Paragraph(s["ev_recommendation"],           styles["body"]),
                 Paragraph(_fmt_volume(s["notional_usd"], s["open_interest"]), styles["small"]),
+                Paragraph(s.get("confidence", "—"),         styles["body"]),
+                Paragraph(s.get("confidence_reason", "—"),  styles["body"]),
             ])
-        pev_table = Table(ev_picks_data, colWidths=[W * f for f in [0.07, 0.38, 0.11, 0.11, 0.17, 0.16]])
+        pev_table = Table(ev_picks_data, colWidths=[W * f for f in [0.06, 0.21, 0.13, 0.10, 0.09, 0.14, 0.13, 0.07, 0.07]])
         pev_cmds = header_row_style(0, C_NAVY) + grid_style() + [
             ("FONTNAME",   (0, 1), (-1, -1), "Helvetica"),
             ("FONTSIZE",   (0, 1), (-1, -1), 8.5),
@@ -2701,8 +2815,8 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
             ("VALIGN",        (0, 0), (-1, -1), "TOP"),
         ]
         for i in range(1, len(by_ev) + 1):
-            pev_cmds.append(("TEXTCOLOR", (2, i), (4, i), C_GREEN))
-            pev_cmds.append(("FONTNAME",  (2, i), (4, i), "Helvetica-Bold"))
+            pev_cmds.append(("TEXTCOLOR", (3, i), (5, i), C_GREEN))
+            pev_cmds.append(("FONTNAME",  (3, i), (5, i), "Helvetica-Bold"))
         pev_table.setStyle(TableStyle(pev_cmds))
         story.append(pev_table)
         story.append(Spacer(1, 0.4 * cm))
@@ -2842,6 +2956,45 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
         mini_table.setStyle(TableStyle(mini_cmds))
         story.append(mini_table)
         story.append(Spacer(1, 0.3 * cm))
+
+    # ── SECTION 7: WHY column legend ─────────────────────────────────────────
+    legend_header = Table(
+        [[Paragraph("WHY COLUMN LEGEND  (confidence_reason key)", styles["h1"])]],
+        colWidths=[W],
+    )
+    legend_header.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, -1), C_BLUE),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+        ("TOPPADDING",   (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+    ]))
+    story.append(legend_header)
+
+    items = list(_CONFIDENCE_REASON_LEGEND.items())
+    legend_data: list[list] = []
+    for i in range(0, len(items), 2):
+        row: list = []
+        for k, v in items[i:i + 2]:
+            row.append(Paragraph(f"<b>{k}</b>", styles["bold"]))
+            row.append(Paragraph(v, styles["small"]))
+        # Pad to 4 cells if odd item count
+        while len(row) < 4:
+            row.append(Paragraph("", styles["small"]))
+        legend_data.append(row)
+
+    leg_col_w = [W * f for f in [0.10, 0.40, 0.10, 0.40]]
+    leg_table = Table(legend_data, colWidths=leg_col_w)
+    leg_table.setStyle(TableStyle([
+        ("FONTSIZE",      (0, 0), (-1, -1), 8.5),
+        ("TOPPADDING",    (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+        ("GRID",          (0, 0), (-1, -1), 0.4, C_LGRAY),
+        ("ROWBACKGROUNDS",(0, 0), (-1, -1), [C_WHITE, C_ALT]),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(leg_table)
+    story.append(Spacer(1, 0.4 * cm))
 
     # ── Footer ────────────────────────────────────────────────────────────────
     story.append(Spacer(1, 0.3 * cm))
@@ -3123,10 +3276,12 @@ Examples:
                 analysis = llm_analysis(market, rows, llm_client, web_context=web_context)
                 display_llm_analysis(analysis, provider=args.llm)
                 display_run_metrics(metrics)
+                llm_probs = parse_llm_probabilities(analysis)
                 report_data = ReportData(
                     market=market,
                     rows=rows,
                     analysis_text=analysis,
+                    llm_probs=llm_probs,
                     metrics=metrics,
                     is_deep_research=False,
                 )
