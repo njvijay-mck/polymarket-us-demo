@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.polymarket.us)",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:github.com)",
+      "Bash(uv --version:*)",
+      "Bash(uv init:*)",
+      "Bash(dir:*)",
+      "Bash(uv sync:*)",
+      "Bash(uv run python:*)",
+      "Bash(uv add:*)",
+      "Bash(python -c:*)",
+      "mcp__Windows-MCP__Shell",
+      "Bash(git config:*)",
+      "Bash(GH=\"/c/Program Files/GitHub CLI/gh.exe\")",
+      "Bash(\"$GH\" repo create polymarket-us-demo --public --description \"Python scripts demonstrating the Polymarket US retail API and SDK — market browsing, search, order book, trading, async, WebSocket streaming, and date-based filtering\" --homepage \"https://polymarket.us\")",
+      "Bash(__NEW_LINE_2e73ba723b048974__ git commit -m \"$\\(cat <<''EOF''\nInitial commit: Polymarket US API demo scripts\n\nEight Python scripts demonstrating the polymarket-us SDK:\n- 01-03: Public endpoints \\(browse, search, order book\\)\n- 04-07: Authenticated endpoints \\(portfolio, orders, async, WebSocket\\)\n- 08: Date-based market filtering with keyword search\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(__NEW_LINE_e8f64ffda529977f__ \"$GH\" pr create --title \"feat: odds calculator + Claude LLM probability analysis \\(script 09\\)\" --base master --head feature/09-odds-probability-llm --body \"$\\(cat <<''EOF''\n## Summary\n\n- **New script** `09_odds_calculator.py` — fetches live Polymarket prices and converts them into all major odds formats, then passes the structured data to Claude for a plain-English win-probability analysis\n- **Odds formats**: implied probability, decimal \\(European\\), American \\(moneyline\\), fractional \\(UK\\), and book overround/vig\n- **LLM analysis**: Claude identifies the favourite/underdog, comments on mispricing, calculates contrarian edge, and gives a concise recommendation \\(`value on YES / NO`, `fairly priced`, or `avoid`\\)\n- **New dependency**: `anthropic>=0.80.0` added to `pyproject.toml`\n- **Updated**: `README.md` \\(new section, odds table, updated `.env` docs, project structure\\), `.env.example` \\(added `ANTHROPIC_API_KEY`\\)\n\n## Usage\n\n```bash\nuv run 09_odds_calculator.py btc-100k-2025\nuv run 09_odds_calculator.py btc-100k-2025 --no-llm\nuv run 09_odds_calculator.py --search \"bitcoin\" --pick 0\nuv run 09_odds_calculator.py btc-100k-2025 --model claude-opus-4-5\n```\n\n## Test plan\n\n- [ ] `uv run 09_odds_calculator.py <valid-slug>` — fetches market, prints odds table, returns Claude analysis\n- [ ] `uv run 09_odds_calculator.py <valid-slug> --no-llm` — odds table only, no API call to Anthropic\n- [ ] `uv run 09_odds_calculator.py --search \"bitcoin\" --pick 0` — search path works end-to-end\n- [ ] `uv run 09_odds_calculator.py <invalid-slug>` — exits cleanly with \"not found\" message\n- [ ] Without `ANTHROPIC_API_KEY` set — prints skip message gracefully instead of crashing\n- [ ] `uv sync` installs `anthropic` package correctly from updated `pyproject.toml`\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\nEOF\n\\)\")",
+      "Bash(uv run:*)",
+      "WebSearch",
+      "WebFetch(domain:gist.github.com)",
+      "WebFetch(domain:docs.polymarket.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(git pull:*)",
+      "Bash(git branch:*)"
+    ]
+  }
+}
