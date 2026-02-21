@@ -259,6 +259,42 @@ def _market_end_et_str(market: dict) -> str | None:
         return None
 
 
+def _game_has_started(market: dict) -> bool:
+    """Return True if gameStartTime is in the past relative to now (UTC).
+
+    Markets without a gameStartTime return False (fail-open — keep them).
+    """
+    raw = market.get("gameStartTime")
+    if not raw:
+        return False
+    try:
+        clean = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt <= datetime.now(timezone.utc)
+    except (ValueError, AttributeError):
+        return False
+
+
+def _filter_started_markets(markets: list[dict]) -> list[dict]:
+    """Remove markets whose game has already started and print a summary.
+
+    Compares gameStartTime (UTC) to the current wall-clock time.
+    Markets without a gameStartTime are kept (fail-open).
+    """
+    upcoming, skipped = [], []
+    for m in markets:
+        (skipped if _game_has_started(m) else upcoming).append(m)
+    if skipped:
+        print(f"\n  Skipping {len(skipped)} already-started market(s):")
+        for m in skipped:
+            q = m.get("question", m.get("slug", "?"))
+            print(f"    · {q}  [{_game_start_et_str(m)}]")
+        print()
+    return upcoming
+
+
 def _game_start_et_str(market: dict) -> str:
     """Return the game start time as 'Mon DD H:MMam/pm ET', e.g. 'Feb 21 7:30PM ET'.
 
@@ -3177,6 +3213,14 @@ Examples:
                 pm_client, args.date, args.pick, args.limit,
                 min_volume_usd=args.min_volume,
             )
+
+        # Filter out games that have already started (date/search modes only;
+        # single-slug is an explicit request so we always honour it).
+        if not args.slug:
+            markets = _filter_started_markets(markets)
+            if not markets:
+                print("  No upcoming markets to analyse — all games on this date have already started.")
+                return
 
         # Create LLM client once (reused across all markets)
         llm_client = None
