@@ -259,6 +259,27 @@ def _market_end_et_str(market: dict) -> str | None:
         return None
 
 
+def _game_start_et_str(market: dict) -> str:
+    """Return the game start time as 'Mon DD H:MMam/pm ET', e.g. 'Feb 21 7:30PM ET'.
+
+    Reads the gameStartTime field (ISO UTC) and converts to Eastern Time.
+    Returns '—' if the field is absent or unparseable.
+    """
+    raw = market.get("gameStartTime")
+    if not raw:
+        return "—"
+    try:
+        clean = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt_et = dt.astimezone(_EST)
+        hour = dt_et.strftime("%I").lstrip("0") or "12"
+        return dt_et.strftime(f"%b %d {hour}:%M%p ET")  # e.g. "Feb 21 7:30PM ET"
+    except (ValueError, AttributeError):
+        return "—"
+
+
 def _game_date_from_slug(slug: str) -> dt_date | None:
     """Extract the game/event date from the end of a sports market slug.
 
@@ -1640,6 +1661,7 @@ def _compute_market_summary(report: ReportData) -> dict:
         "open_interest":     market.get("_open_interest", 0.0),
         "confidence":        confidence,
         "confidence_reason": confidence_reason,
+        "game_start":        _game_start_et_str(market),
     }
 
 
@@ -2703,27 +2725,29 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
         ]))
         story.append(picks_header)
         picks_data = [[
-            Paragraph("<b>Rank</b>",   styles["small"]),
-            Paragraph("<b>Market</b>", styles["small"]),
-            Paragraph("<b>Edge</b>",   styles["small"]),
-            Paragraph("<b>Volume</b>", styles["small"]),
-            Paragraph("<b>Rec</b>",    styles["small"]),
-            Paragraph("<b>Conf</b>",   styles["small"]),
-            Paragraph("<b>Why</b>",    styles["small"]),
+            Paragraph("<b>Rank</b>",      styles["small"]),
+            Paragraph("<b>Market</b>",    styles["small"]),
+            Paragraph("<b>Game Time</b>", styles["small"]),
+            Paragraph("<b>Edge</b>",      styles["small"]),
+            Paragraph("<b>Volume</b>",    styles["small"]),
+            Paragraph("<b>Rec</b>",       styles["small"]),
+            Paragraph("<b>Conf</b>",      styles["small"]),
+            Paragraph("<b>Why</b>",       styles["small"]),
         ]]
         for i, s in enumerate(by_edge, 1):
             edge_val  = s["best_edge"]
             edge_str  = f"{s['best_edge_label']} {edge_val:+.1f}%"
             picks_data.append([
-                Paragraph(f"#{i}",                 styles["body"]),
-                Paragraph(s["question"],            styles["body"]),
-                Paragraph(edge_str,                 styles["body"]),
+                Paragraph(f"#{i}",                          styles["body"]),
+                Paragraph(s["question"],                    styles["body"]),
+                Paragraph(s.get("game_start", "—"),         styles["small"]),
+                Paragraph(edge_str,                         styles["body"]),
                 Paragraph(_fmt_volume(s["notional_usd"], s["open_interest"]), styles["small"]),
-                Paragraph(s["recommendation"],      styles["body"]),
-                Paragraph(s.get("confidence", "—"), styles["body"]),
-                Paragraph(s.get("confidence_reason", "—"), styles["body"]),
+                Paragraph(s["recommendation"],              styles["body"]),
+                Paragraph(s.get("confidence", "—"),         styles["body"]),
+                Paragraph(s.get("confidence_reason", "—"),  styles["body"]),
             ])
-        pe_table = Table(picks_data, colWidths=[W * f for f in [0.06, 0.33, 0.15, 0.15, 0.14, 0.09, 0.08]])
+        pe_table = Table(picks_data, colWidths=[W * f for f in [0.06, 0.22, 0.13, 0.15, 0.15, 0.13, 0.08, 0.08]])
         pe_cmds = header_row_style(0, C_NAVY) + grid_style() + [
             ("FONTNAME",   (0, 1), (-1, -1), "Helvetica"),
             ("FONTSIZE",   (0, 1), (-1, -1), 8.5),
@@ -2759,27 +2783,29 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
         ]))
         story.append(ev_picks_header)
         ev_picks_data = [[
-            Paragraph("<b>Rank</b>",   styles["small"]),
-            Paragraph("<b>Market</b>", styles["small"]),
-            Paragraph("<b>EV/c</b>",   styles["small"]),
-            Paragraph("<b>ROI</b>",    styles["small"]),
-            Paragraph("<b>Rec</b>",    styles["small"]),
-            Paragraph("<b>Volume</b>", styles["small"]),
-            Paragraph("<b>Conf</b>",   styles["small"]),
-            Paragraph("<b>Why</b>",    styles["small"]),
+            Paragraph("<b>Rank</b>",      styles["small"]),
+            Paragraph("<b>Market</b>",    styles["small"]),
+            Paragraph("<b>Game Time</b>", styles["small"]),
+            Paragraph("<b>EV/c</b>",      styles["small"]),
+            Paragraph("<b>ROI</b>",       styles["small"]),
+            Paragraph("<b>Rec</b>",       styles["small"]),
+            Paragraph("<b>Volume</b>",    styles["small"]),
+            Paragraph("<b>Conf</b>",      styles["small"]),
+            Paragraph("<b>Why</b>",       styles["small"]),
         ]]
         for i, s in enumerate(by_ev, 1):
             ev_picks_data.append([
-                Paragraph(f"#{i}",                   styles["body"]),
-                Paragraph(s["question"],             styles["body"]),
-                Paragraph(f"{s['best_ev']:+.3f}",    styles["body"]),
-                Paragraph(f"{s['roi']:+.1f}%",       styles["body"]),
-                Paragraph(s["ev_recommendation"],    styles["body"]),
+                Paragraph(f"#{i}",                          styles["body"]),
+                Paragraph(s["question"],                    styles["body"]),
+                Paragraph(s.get("game_start", "—"),         styles["small"]),
+                Paragraph(f"{s['best_ev']:+.3f}",           styles["body"]),
+                Paragraph(f"{s['roi']:+.1f}%",              styles["body"]),
+                Paragraph(s["ev_recommendation"],           styles["body"]),
                 Paragraph(_fmt_volume(s["notional_usd"], s["open_interest"]), styles["small"]),
-                Paragraph(s.get("confidence", "—"),  styles["body"]),
-                Paragraph(s.get("confidence_reason", "—"), styles["body"]),
+                Paragraph(s.get("confidence", "—"),         styles["body"]),
+                Paragraph(s.get("confidence_reason", "—"),  styles["body"]),
             ])
-        pev_table = Table(ev_picks_data, colWidths=[W * f for f in [0.06, 0.30, 0.10, 0.09, 0.15, 0.14, 0.08, 0.08]])
+        pev_table = Table(ev_picks_data, colWidths=[W * f for f in [0.06, 0.21, 0.13, 0.10, 0.09, 0.14, 0.13, 0.07, 0.07]])
         pev_cmds = header_row_style(0, C_NAVY) + grid_style() + [
             ("FONTNAME",   (0, 1), (-1, -1), "Helvetica"),
             ("FONTSIZE",   (0, 1), (-1, -1), 8.5),
@@ -2789,8 +2815,8 @@ def generate_consolidated_pdf(consolidated: ConsolidatedReport, output_path: str
             ("VALIGN",        (0, 0), (-1, -1), "TOP"),
         ]
         for i in range(1, len(by_ev) + 1):
-            pev_cmds.append(("TEXTCOLOR", (2, i), (4, i), C_GREEN))
-            pev_cmds.append(("FONTNAME",  (2, i), (4, i), "Helvetica-Bold"))
+            pev_cmds.append(("TEXTCOLOR", (3, i), (5, i), C_GREEN))
+            pev_cmds.append(("FONTNAME",  (3, i), (5, i), "Helvetica-Bold"))
         pev_table.setStyle(TableStyle(pev_cmds))
         story.append(pev_table)
         story.append(Spacer(1, 0.4 * cm))
